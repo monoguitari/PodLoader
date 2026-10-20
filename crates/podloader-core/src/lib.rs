@@ -5,6 +5,7 @@ pub mod itunesdb;
 pub mod playcounts;
 pub mod signing;
 pub mod sysinfo;
+pub mod transcode;
 
 use std::cell::RefCell;
 use std::fs;
@@ -13,7 +14,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::host::{collect_host_files_from_paths, is_native_ipod_format};
+use crate::host::{
+    collect_host_files_from_paths, is_native_ipod_format, is_transcodable_format,
+};
 use crate::itunesdb::{build_empty_itunesdb, ItunesDb};
 use crate::playcounts::{merge_play_counts_into_tracks, parse_play_counts};
 pub use crate::signing::verify_itunesdb_signatures;
@@ -46,6 +49,10 @@ pub enum PodLoaderError {
     NoActiveDevice,
     #[error("No interrupted Sync Batch to resolve")]
     NoInterruptedBatch,
+    #[error("System ffmpeg is required for lossy AAC/MP3 transcoding but was not found on PATH")]
+    FfmpegUnavailable,
+    #[error("Transcode failed: {0}")]
+    TranscodeFailed(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +102,53 @@ pub struct MountedVolume {
 pub trait HardwareDeviceAdapter: Send + Sync {
     fn list_mounted_volumes(&self) -> Result<Vec<MountedVolume>, PodLoaderError>;
     fn lookup_usb_firewire_guid(&self, mount_path: &Path) -> Option<String>;
+    fn is_ffmpeg_available(&self) -> bool {
+        false
+    }
+    fn transcode_lossy(
+        &self,
+        input_path: &Path,
+        output_path: &Path,
+        preset: TranscodePreset,
+        host_file: &HostFile,
+    ) -> Result<(), PodLoaderError> {
+        if !self.is_ffmpeg_available() {
+            return Err(PodLoaderError::FfmpegUnavailable);
+        }
+        let codec_args: &[&str] = match preset {
+            TranscodePreset::Aac => &["-vn", "-c:a", "aac", "-b:a", "256k"],
+            TranscodePreset::Mp3 => &["-vn", "-c:a", "libmp3lame", "-b:a", "256k"],
+            TranscodePreset::Alac => &["-vn", "-c:a", "alac"],
+        };
+        let status = std::process::Command::new("ffmpeg")
+            .arg("-y")
+            .arg("-i")
+            .arg(input_path)
+            .args(codec_args)
+            .arg("-metadata")
+            .arg(format!("title={}", host_file.title))
+            .arg("-metadata")
+            .arg(format!("artist={}", host_file.artist))
+            .arg("-metadata")
+            .arg(format!("album={}", host_file.album))
+            .arg("-metadata")
+            .arg(format!("track={}", host_file.track_number))
+            .arg("-metadata")
+            .arg(format!("disc={}", host_file.disc_number))
+            .arg("-metadata")
+            .arg(format!("genre={}", host_file.genre))
+            .arg("-metadata")
+            .arg(format!("date={}", host_file.year))
+            .arg(output_path)
+            .status()?;
+        if !status.success() {
+            return Err(PodLoaderError::TranscodeFailed(format!(
+                "ffmpeg exited with status {}",
+                status
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -144,6 +198,14 @@ impl HardwareDeviceAdapter for SystemHardwareDeviceAdapter {
 
     fn lookup_usb_firewire_guid(&self, _mount_path: &Path) -> Option<String> {
         self.scan_apple_usb_serial_guid()
+    }
+
+    fn is_ffmpeg_available(&self) -> bool {
+        std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     }
 }
 
@@ -299,6 +361,15 @@ pub enum DuplicateResolution {
     ReplaceExisting,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TranscodePreset {
+    #[default]
+    Alac,
+    Aac,
+    Mp3,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StagedTrackAddition {
@@ -308,6 +379,8 @@ pub struct StagedTrackAddition {
     pub is_duplicate: bool,
     pub matched_device_track_id: Option<u32>,
     pub duplicate_resolution: DuplicateResolution,
+    pub requires_transcode: bool,
+    pub target_format: Option<TranscodePreset>,
 }
 
 impl StagedTrackAddition {
@@ -340,6 +413,17 @@ pub enum InterruptedResolution {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferProgress {
+    pub current_track_index: usize,
+    pub total_tracks: usize,
+    pub current_track_title: String,
+    pub is_transcoding: bool,
+    pub track_percent: u8,
+    pub overall_percent: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", content = "data", rename_all = "camelCase")]
 pub enum CommitOutcome {
     Completed(DeviceSession),
@@ -354,6 +438,8 @@ pub struct DeviceSession {
     pub has_pending_play_counts: bool,
     pub sync_batch: SyncBatch,
     pub interrupted_batch: Option<InterruptedBatchSummary>,
+    pub transcode_preset: TranscodePreset,
+    pub ffmpeg_available: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -383,6 +469,7 @@ struct EngineState {
     next_staged_id: u64,
     next_obfuscated_counter: u64,
     interrupted_journal: Option<InterruptedJournal>,
+    transcode_preset: TranscodePreset,
 }
 
 pub struct PodLoaderEngine<A: HardwareDeviceAdapter> {
@@ -400,6 +487,7 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
                 next_staged_id: 1,
                 next_obfuscated_counter: 1,
                 interrupted_journal: None,
+                transcode_preset: TranscodePreset::Alac,
             }),
         }
     }
@@ -500,7 +588,9 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
         let mut st = self.state.borrow_mut();
 
         for hf in host_files {
-            if !is_native_ipod_format(&hf.format) {
+            let is_native = is_native_ipod_format(&hf.format);
+            let is_transcodable = is_transcodable_format(&hf.format);
+            if !is_native && !is_transcodable {
                 continue;
             }
             let matched = current
@@ -511,6 +601,7 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
             let is_duplicate = matched.is_some();
             let staged_id = st.next_staged_id;
             st.next_staged_id += 1;
+            let active_preset = st.transcode_preset;
 
             st.sync_batch.additions.push(StagedTrackAddition {
                 staged_id,
@@ -522,6 +613,12 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
                     DuplicateResolution::Skip
                 } else {
                     DuplicateResolution::ImportAnyway
+                },
+                requires_transcode: is_transcodable,
+                target_format: if is_transcodable {
+                    Some(active_preset)
+                } else {
+                    None
                 },
             });
         }
@@ -551,6 +648,34 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
         Ok(st.sync_batch.clone())
     }
 
+    pub fn set_transcode_preset(
+        &mut self,
+        preset: TranscodePreset,
+    ) -> Result<DeviceSession, PodLoaderError> {
+        let _ = match self.scan_device()? {
+            DeviceConnectionState::Connected(session) => session,
+            _ => return Err(PodLoaderError::NoActiveDevice),
+        };
+        if matches!(preset, TranscodePreset::Aac | TranscodePreset::Mp3)
+            && !self.adapter.is_ffmpeg_available()
+        {
+            return Err(PodLoaderError::FfmpegUnavailable);
+        }
+        {
+            let mut st = self.state.borrow_mut();
+            st.transcode_preset = preset;
+            for item in &mut st.sync_batch.additions {
+                if item.requires_transcode {
+                    item.target_format = Some(preset);
+                }
+            }
+        }
+        match self.scan_device()? {
+            DeviceConnectionState::Connected(updated) => Ok(updated),
+            _ => Err(PodLoaderError::NoActiveDevice),
+        }
+    }
+
     pub fn commit_sync_batch(&mut self) -> Result<CommitOutcome, PodLoaderError> {
         self.commit_sync_batch_with_limit(None)
     }
@@ -559,6 +684,17 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
         &mut self,
         max_tracks_before_interrupt: Option<usize>,
     ) -> Result<CommitOutcome, PodLoaderError> {
+        self.commit_sync_batch_with_progress(max_tracks_before_interrupt, |_| {})
+    }
+
+    pub fn commit_sync_batch_with_progress<F>(
+        &mut self,
+        max_tracks_before_interrupt: Option<usize>,
+        mut on_progress: F,
+    ) -> Result<CommitOutcome, PodLoaderError>
+    where
+        F: FnMut(TransferProgress),
+    {
         let current = match self.scan_device()? {
             DeviceConnectionState::Connected(session) => session,
             _ => return Err(PodLoaderError::NoActiveDevice),
@@ -610,11 +746,21 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
                 }
             }
 
+            let target_ext = if item.requires_transcode {
+                match item.target_format.unwrap_or(TranscodePreset::Alac) {
+                    TranscodePreset::Alac | TranscodePreset::Aac => Some("m4a"),
+                    TranscodePreset::Mp3 => Some("mp3"),
+                }
+            } else {
+                None
+            };
+
             let (disk_path, obfuscated_path) = {
                 let mut st = self.state.borrow_mut();
                 allocate_obfuscated_path(
                     &mount_path,
                     &item.host_file.path,
+                    target_ext,
                     &mut st.next_obfuscated_counter,
                 )?
             };
@@ -622,13 +768,105 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
             if let Some(parent) = disk_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            if let Err(err) = copy_file_bytes(&item.host_file.path, &disk_path) {
+
+            let mut db_host_file = item.host_file.clone();
+            let mut track_sample_rate_hz: Option<u32> = None;
+
+            on_progress(TransferProgress {
+                current_track_index: idx + 1,
+                total_tracks: total_active,
+                current_track_title: item.host_file.title.clone(),
+                is_transcoding: item.requires_transcode,
+                track_percent: 0,
+                overall_percent: if total_active > 0 {
+                    ((idx * 100) / total_active) as u8
+                } else {
+                    0
+                },
+            });
+
+            if item.requires_transcode {
+                let preset = item.target_format.unwrap_or(TranscodePreset::Alac);
+                let title_for_cb = item.host_file.title.clone();
+                let transcode_result = match preset {
+                    TranscodePreset::Alac => transcode::transcode_to_alac_m4a(
+                        &item.host_file,
+                        &disk_path,
+                        |done, total| {
+                            let track_pct = if total > 0 {
+                                ((done.saturating_mul(100)) / total).min(100) as u8
+                            } else {
+                                50
+                            };
+                            let overall_pct = if total_active > 0 {
+                                (((idx * 100) + (track_pct as usize)) / total_active).min(100) as u8
+                            } else {
+                                track_pct
+                            };
+                            on_progress(TransferProgress {
+                                current_track_index: idx + 1,
+                                total_tracks: total_active,
+                                current_track_title: title_for_cb.clone(),
+                                is_transcoding: true,
+                                track_percent: track_pct,
+                                overall_percent: overall_pct,
+                            });
+                        },
+                    ),
+                    TranscodePreset::Aac | TranscodePreset::Mp3 => self
+                        .adapter
+                        .transcode_lossy(&item.host_file.path, &disk_path, preset, &item.host_file)
+                        .and_then(|()| {
+                            let written_size = fs::metadata(&disk_path)?.len();
+                            Ok(transcode::TranscodedOutputInfo {
+                                file_size: written_size,
+                                duration_ms: item.host_file.duration_ms.max(1000),
+                                bitrate_kbps: 256,
+                                sample_rate: 44_100,
+                            })
+                        }),
+                };
+
+                match transcode_result {
+                    Ok(info) => {
+                        db_host_file.format = match preset {
+                            TranscodePreset::Alac => "ALAC".to_string(),
+                            TranscodePreset::Aac => "AAC".to_string(),
+                            TranscodePreset::Mp3 => "MP3".to_string(),
+                        };
+                        db_host_file.file_size = info.file_size;
+                        db_host_file.duration_ms = info.duration_ms;
+                        db_host_file.bitrate_kbps = info.bitrate_kbps;
+                        track_sample_rate_hz = Some(info.sample_rate);
+                    }
+                    Err(err) => {
+                        if disk_path.is_file() {
+                            created_disk_paths.push(disk_path);
+                        }
+                        interruption_reason = Some(err.to_string());
+                        break;
+                    }
+                }
+            } else if let Err(err) = copy_file_bytes(&item.host_file.path, &disk_path) {
                 if disk_path.is_file() {
                     created_disk_paths.push(disk_path);
                 }
                 interruption_reason = Some(err.to_string());
                 break;
             }
+
+            on_progress(TransferProgress {
+                current_track_index: idx + 1,
+                total_tracks: total_active,
+                current_track_title: item.host_file.title.clone(),
+                is_transcoding: item.requires_transcode,
+                track_percent: 100,
+                overall_percent: if total_active > 0 {
+                    (((idx + 1) * 100) / total_active).min(100) as u8
+                } else {
+                    100
+                },
+            });
 
             let replace_id = if item.is_duplicate
                 && item.duplicate_resolution == DuplicateResolution::ReplaceExisting
@@ -639,10 +877,11 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
             };
 
             let (_track_id, old_obfuscated) = parsed_db.upsert_transferred_track(
-                &item.host_file,
+                &db_host_file,
                 &obfuscated_path,
                 replace_id,
                 item.target_playlist_id,
+                track_sample_rate_hz,
             );
             if let Some(old_obf) = old_obfuscated {
                 let old_disk = obfuscated_to_disk_path(&mount_path, &old_obf);
@@ -820,16 +1059,18 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
 
         let used_bytes = vol.total_bytes.saturating_sub(vol.free_bytes);
 
-        let (sync_batch, interrupted_batch) = {
+        let (sync_batch, interrupted_batch, transcode_preset) = {
             let mut st = self.state.borrow_mut();
             if st.active_mount_path.as_ref() != Some(&vol.mount_path) {
                 st.active_mount_path = Some(vol.mount_path.clone());
                 st.sync_batch = SyncBatch::default();
                 st.interrupted_journal = None;
+                st.transcode_preset = TranscodePreset::Alac;
             }
             (
                 st.sync_batch.clone(),
                 st.interrupted_journal.as_ref().map(|j| j.summary.clone()),
+                st.transcode_preset,
             )
         };
 
@@ -847,6 +1088,8 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
             has_pending_play_counts,
             sync_batch,
             interrupted_batch,
+            transcode_preset,
+            ffmpeg_available: self.adapter.is_ffmpeg_available(),
         }))
     }
 }
@@ -910,13 +1153,18 @@ fn recalculate_required_bytes(batch: &mut SyncBatch) {
 fn allocate_obfuscated_path(
     mount_path: &Path,
     source_path: &Path,
+    override_ext: Option<&str>,
     counter: &mut u64,
 ) -> Result<(PathBuf, String), PodLoaderError> {
-    let ext = source_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("mp3")
-        .to_ascii_lowercase();
+    let ext = override_ext
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_else(|| {
+            source_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("mp3")
+                .to_ascii_lowercase()
+        });
 
     let time_entropy = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

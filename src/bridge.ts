@@ -78,6 +78,8 @@ export interface HostDirectoryListing {
 
 export type DuplicateResolution = "skip" | "importAnyway" | "replaceExisting";
 
+export type TranscodePreset = "alac" | "aac" | "mp3";
+
 export interface StagedTrackAddition {
   stagedId: number;
   hostFile: HostFile;
@@ -85,6 +87,17 @@ export interface StagedTrackAddition {
   isDuplicate: boolean;
   matchedDeviceTrackId?: number | null;
   duplicateResolution: DuplicateResolution;
+  requiresTranscode?: boolean;
+  targetFormat?: TranscodePreset | null;
+}
+
+export interface TransferProgress {
+  currentTrackIndex: number;
+  totalTracks: number;
+  currentTrackTitle: string;
+  isTranscoding: boolean;
+  trackPercent: number;
+  overallPercent: number;
 }
 
 export interface SyncBatch {
@@ -107,6 +120,8 @@ export interface DeviceSession {
   hasPendingPlayCounts: boolean;
   syncBatch?: SyncBatch;
   interruptedBatch?: InterruptedBatchSummary | null;
+  transcodePreset?: TranscodePreset;
+  ffmpegAvailable?: boolean;
 }
 
 export type CommitOutcome =
@@ -135,9 +150,11 @@ export interface PodLoaderBridge {
   ): Promise<SyncBatch>;
   commitSyncBatch?(options?: {
     maxTracksBeforeInterrupt?: number;
+    onProgress?: (progress: TransferProgress) => void;
   }): Promise<CommitOutcome>;
   resolveInterruptedBatch?(
     resolution: InterruptedResolution,
   ): Promise<DeviceSession>;
   setManualFirewireGuid?(guid: string): Promise<DeviceSession>;
+  setTranscodePreset?(preset: TranscodePreset): Promise<DeviceSession>;
 }

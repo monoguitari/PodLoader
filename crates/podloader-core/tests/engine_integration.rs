@@ -5,7 +5,7 @@ use tempfile::TempDir;
 use podloader_core::{
     verify_itunesdb_signatures, CommitOutcome, DeviceConnectionState, DuplicateResolution,
     HardwareDeviceAdapter, InterruptedResolution, MountedVolume, PlaylistKind, PodLoaderEngine,
-    PodLoaderError,
+    PodLoaderError, TranscodePreset, TransferProgress,
 };
 
 struct FakeHardwareAdapter {
@@ -1637,6 +1637,786 @@ fn updates_master_playlist_index_mhods_mhsd_type3_and_re_signs_extracted_hash72(
     assert_eq!(found_mhod52, 2, "expected mhod 52 in both mhsd type 3 and type 2");
     assert_eq!(found_mhod53, 2, "expected mhod 53 in both mhsd type 3 and type 2");
 }
+
+#[test]
+fn stages_flac_ogg_and_opus_files_marked_for_alac_transcoding_while_passing_through_native_formats() {
+    let device_temp = TempDir::new().expect("create device temp dir");
+    let mount_path = device_temp.path().to_path_buf();
+
+    let adapter = FakeHardwareAdapter {
+        volumes: vec![MountedVolume {
+            mount_path: mount_path.clone(),
+            volume_name: "IPOD".to_string(),
+            total_bytes: 30_000_000_000,
+            free_bytes: 29_950_000_000,
+            usb_firewire_guid: None,
+        }],
+    };
+    let mut engine = PodLoaderEngine::new(adapter);
+    let state = engine
+        .initialize_device(&mount_path, "My iPod")
+        .expect("initialize device");
+    match state {
+        DeviceConnectionState::Connected(session) => {
+            assert_eq!(session.transcode_preset, TranscodePreset::Alac);
+        }
+        other => panic!("expected Connected, got {:?}", other),
+    }
+
+    let host_temp = TempDir::new().expect("create host temp dir");
+    let flac_path = host_temp.path().join("01 - Everything In Its Right Place.flac");
+    let ogg_path = host_temp.path().join("02 - Kid A.ogg");
+    let opus_path = host_temp.path().join("03 - The National Anthem.opus");
+    let mp3_path = host_temp.path().join("04 - How to Disappear Completely.mp3");
+    let wav_path = host_temp.path().join("05 - Treefingers.wav");
+
+    fs::write(&flac_path, b"fLaC\x00\x00\x00\x22").expect("write flac stub");
+    fs::write(&ogg_path, b"OggS\x00\x02").expect("write ogg stub");
+    fs::write(&opus_path, b"OggS\x00\x02OpusHead").expect("write opus stub");
+    fs::write(
+        &mp3_path,
+        build_id3v23_mp3_fixture(
+            "How to Disappear Completely",
+            "Radiohead",
+            "Kid A",
+            4,
+            "Electronic",
+            2000,
+            4,
+        ),
+    )
+    .expect("write mp3");
+    fs::write(&wav_path, build_wav_fixture(44_100, 2)).expect("write wav");
+
+    let listing = engine
+        .browse_host_directory(host_temp.path())
+        .expect("browse host directory");
+    assert_eq!(listing.files.len(), 5);
+
+    let batch = engine
+        .stage_host_paths(
+            &[flac_path, ogg_path, opus_path, mp3_path, wav_path],
+            None,
+        )
+        .expect("stage host paths");
+
+    assert_eq!(batch.additions.len(), 5);
+
+    // FLAC, OGG, Opus are marked for transcoding with active preset (Alac)
+    assert_eq!(batch.additions[0].host_file.format, "FLAC");
+    assert!(batch.additions[0].requires_transcode);
+    assert_eq!(
+        batch.additions[0].target_format,
+        Some(TranscodePreset::Alac)
+    );
+
+    assert_eq!(batch.additions[1].host_file.format, "OGG");
+    assert!(batch.additions[1].requires_transcode);
+    assert_eq!(
+        batch.additions[1].target_format,
+        Some(TranscodePreset::Alac)
+    );
+
+    assert_eq!(batch.additions[2].host_file.format, "OPUS");
+    assert!(batch.additions[2].requires_transcode);
+    assert_eq!(
+        batch.additions[2].target_format,
+        Some(TranscodePreset::Alac)
+    );
+
+    // Native MP3 and WAV pass through untouched
+    assert_eq!(batch.additions[3].host_file.format, "MP3");
+    assert!(!batch.additions[3].requires_transcode);
+    assert_eq!(batch.additions[3].target_format, None);
+
+    assert_eq!(batch.additions[4].host_file.format, "WAV");
+    assert!(!batch.additions[4].requires_transcode);
+    assert_eq!(batch.additions[4].target_format, None);
+}
+
+fn crc8_flac(data: &[u8]) -> u8 {
+    let mut crc = 0u8;
+    for &b in data {
+        crc ^= b;
+        for _ in 0..8 {
+            if (crc & 0x80) != 0 {
+                crc = (crc << 1) ^ 0x07;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    crc
+}
+
+fn crc16_flac(data: &[u8]) -> u16 {
+    let mut crc = 0u16;
+    for &b in data {
+        crc ^= (b as u16) << 8;
+        for _ in 0..8 {
+            if (crc & 0x8000) != 0 {
+                crc = (crc << 1) ^ 0x8005;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    crc
+}
+
+fn crc32_ogg(data: &[u8]) -> u32 {
+    let mut crc = 0u32;
+    for &b in data {
+        crc ^= (b as u32) << 24;
+        for _ in 0..8 {
+            if (crc & 0x8000_0000) != 0 {
+                crc = (crc << 1) ^ 0x04C1_1DB7;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    crc
+}
+
+fn build_vorbis_comment_payload(comments: &[(&str, &str)]) -> Vec<u8> {
+    let vendor = b"PodLoaderTest";
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+    payload.extend_from_slice(vendor);
+    payload.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+    for (k, v) in comments {
+        let entry = format!("{}={}", k, v);
+        payload.extend_from_slice(&(entry.len() as u32).to_le_bytes());
+        payload.extend_from_slice(entry.as_bytes());
+    }
+    payload
+}
+
+fn build_flac_picture_payload(mime: &str, data: &[u8]) -> Vec<u8> {
+    let mut pic = Vec::new();
+    pic.extend_from_slice(&3u32.to_be_bytes()); // Front cover
+    pic.extend_from_slice(&(mime.len() as u32).to_be_bytes());
+    pic.extend_from_slice(mime.as_bytes());
+    pic.extend_from_slice(&0u32.to_be_bytes()); // description len
+    pic.extend_from_slice(&64u32.to_be_bytes()); // width
+    pic.extend_from_slice(&64u32.to_be_bytes()); // height
+    pic.extend_from_slice(&24u32.to_be_bytes()); // color depth
+    pic.extend_from_slice(&0u32.to_be_bytes()); // indexed colors
+    pic.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    pic.extend_from_slice(data);
+    pic
+}
+
+fn build_flac_streaminfo_bytes(sample_rate: u32, channels: u8, bits_per_sample: u8, total_samples: u64) -> [u8; 34] {
+    let mut si = [0u8; 34];
+    let block_size = 4096u16;
+    si[0..2].copy_from_slice(&block_size.to_be_bytes());
+    si[2..4].copy_from_slice(&block_size.to_be_bytes());
+    // bytes 4..10: min/max frame size = 0
+    let packed: u64 = ((sample_rate as u64 & 0xFFFFF) << 44)
+        | ((((channels - 1) as u64) & 0x7) << 41)
+        | ((((bits_per_sample - 1) as u64) & 0x1F) << 36)
+        | (total_samples & 0xF_FFFF_FFFF);
+    si[10..18].copy_from_slice(&packed.to_be_bytes());
+    // bytes 18..34: MD5 = 0 (unset)
+    si
+}
+
+fn build_flac_audio_frame(frame_number: u8, sample_rate: u32, sample_val_left: i16, sample_val_right: i16) -> Vec<u8> {
+    // Fixed blocksize (sync = 0xFFF8), block_size_enc = 0xC (4096 samples),
+    // sample_rate_enc = 0x9 (44100 Hz) or 0xA (48000 Hz),
+    // channels_enc = 0x1 (2 channels: independent left/right),
+    // bits_per_sample_enc = 0x4 (16 bits), reserved = 0 -> 0x08
+    let sr_code: u8 = if sample_rate == 48_000 { 0xCA } else { 0xC9 };
+    let mut frame = vec![0xFF, 0xF8, sr_code, 0x18, frame_number];
+    let crc8 = crc8_flac(&frame);
+    frame.push(crc8);
+
+    // Subframe 0 (Left): Constant subframe (0b0_000000_0 = 0x00) + 16-bit big-endian sample
+    frame.push(0x00);
+    frame.extend_from_slice(&sample_val_left.to_be_bytes());
+    // Subframe 1 (Right): Constant subframe (0x00) + 16-bit big-endian sample
+    frame.push(0x00);
+    frame.extend_from_slice(&sample_val_right.to_be_bytes());
+
+    let crc16 = crc16_flac(&frame);
+    frame.extend_from_slice(&crc16.to_be_bytes());
+    frame
+}
+
+fn build_valid_flac_fixture(
+    title: &str,
+    artist: &str,
+    album: &str,
+    track_number: u32,
+    disc_number: u32,
+    genre: &str,
+    year: u32,
+    sample_rate: u32,
+    num_frames: u32,
+    artwork: &[u8],
+) -> Vec<u8> {
+    let total_samples = (num_frames as u64) * 4096;
+    let si = build_flac_streaminfo_bytes(sample_rate, 2, 16, total_samples);
+    let vc = build_vorbis_comment_payload(&[
+        ("TITLE", title),
+        ("ARTIST", artist),
+        ("ALBUM", album),
+        ("TRACKNUMBER", &track_number.to_string()),
+        ("DISCNUMBER", &disc_number.to_string()),
+        ("GENRE", genre),
+        ("DATE", &year.to_string()),
+    ]);
+    let pic = build_flac_picture_payload("image/png", artwork);
+
+    let mut out = Vec::new();
+    out.extend_from_slice(b"fLaC");
+
+    // Block 0: STREAMINFO (not last, type 0, len 34)
+    out.push(0x00);
+    out.extend_from_slice(&[0x00, 0x00, 34]);
+    out.extend_from_slice(&si);
+
+    // Block 1: VORBIS_COMMENT (not last, type 4)
+    out.push(0x04);
+    let vc_len = vc.len() as u32;
+    out.extend_from_slice(&vc_len.to_be_bytes()[1..4]);
+    out.extend_from_slice(&vc);
+
+    // Block 2: PICTURE (last block = 0x80 | 6 = 0x86)
+    out.push(0x86);
+    let pic_len = pic.len() as u32;
+    out.extend_from_slice(&pic_len.to_be_bytes()[1..4]);
+    out.extend_from_slice(&pic);
+
+    for f in 0..num_frames {
+        let sample = ((f as i16) * 200).wrapping_add(1024);
+        out.extend_from_slice(&build_flac_audio_frame(
+            f as u8,
+            sample_rate,
+            sample,
+            -sample,
+        ));
+    }
+    out
+}
+
+fn wrap_ogg_page(
+    header_type: u8,
+    granule_pos: u64,
+    serial: u32,
+    seq_no: u32,
+    packet: &[u8],
+) -> Vec<u8> {
+    let mut segments = Vec::new();
+    let mut rem = packet.len();
+    while rem >= 255 {
+        segments.push(255u8);
+        rem -= 255;
+    }
+    segments.push(rem as u8);
+
+    let mut page = Vec::new();
+    page.extend_from_slice(b"OggS");
+    page.push(0); // version
+    page.push(header_type);
+    page.extend_from_slice(&granule_pos.to_le_bytes());
+    page.extend_from_slice(&serial.to_le_bytes());
+    page.extend_from_slice(&seq_no.to_le_bytes());
+    page.extend_from_slice(&0u32.to_le_bytes()); // CRC placeholder at 22..26
+    page.push(segments.len() as u8);
+    page.extend_from_slice(&segments);
+    page.extend_from_slice(packet);
+
+    let crc = crc32_ogg(&page);
+    page[22..26].copy_from_slice(&crc.to_le_bytes());
+    page
+}
+
+fn build_valid_ogg_fixture(
+    title: &str,
+    artist: &str,
+    album: &str,
+    track_number: u32,
+    disc_number: u32,
+    genre: &str,
+    year: u32,
+    num_frames: u32,
+    artwork: &[u8],
+) -> Vec<u8> {
+    let serial = 0x1234_5678u32;
+    let total_samples = (num_frames as u64) * 4096;
+    let si = build_flac_streaminfo_bytes(44_100, 2, 16, total_samples);
+
+    // Packet 0: Ogg-FLAC identification packet (51 bytes)
+    let mut id_pkt = Vec::with_capacity(51);
+    id_pkt.push(0x7F);
+    id_pkt.extend_from_slice(b"FLAC");
+    id_pkt.push(1); // major
+    id_pkt.push(0); // minor
+    id_pkt.extend_from_slice(&2u16.to_be_bytes()); // 2 metadata packets follow
+    id_pkt.extend_from_slice(b"fLaC");
+    id_pkt.push(0x00); // StreamInfo block header
+    id_pkt.extend_from_slice(&[0x00, 0x00, 34]);
+    id_pkt.extend_from_slice(&si);
+
+    // Packet 1: VorbisComment metadata block
+    let vc = build_vorbis_comment_payload(&[
+        ("TITLE", title),
+        ("ARTIST", artist),
+        ("ALBUM", album),
+        ("TRACKNUMBER", &track_number.to_string()),
+        ("DISCNUMBER", &disc_number.to_string()),
+        ("GENRE", genre),
+        ("DATE", &year.to_string()),
+    ]);
+    let mut vc_pkt = Vec::new();
+    vc_pkt.push(0x04);
+    vc_pkt.extend_from_slice(&(vc.len() as u32).to_be_bytes()[1..4]);
+    vc_pkt.extend_from_slice(&vc);
+
+    // Packet 2: Picture metadata block (last metadata block = 0x86)
+    let pic = build_flac_picture_payload("image/png", artwork);
+    let mut pic_pkt = Vec::new();
+    pic_pkt.push(0x86);
+    pic_pkt.extend_from_slice(&(pic.len() as u32).to_be_bytes()[1..4]);
+    pic_pkt.extend_from_slice(&pic);
+
+    let mut ogg = Vec::new();
+    ogg.extend_from_slice(&wrap_ogg_page(0x02, 0, serial, 0, &id_pkt));
+    ogg.extend_from_slice(&wrap_ogg_page(0x00, 0, serial, 1, &vc_pkt));
+    ogg.extend_from_slice(&wrap_ogg_page(0x00, 0, serial, 2, &pic_pkt));
+
+    for f in 0..num_frames {
+        let is_last = f + 1 == num_frames;
+        let hdr_type = if is_last { 0x04 } else { 0x00 };
+        let granule = ((f + 1) as u64) * 4096;
+        let frame = build_flac_audio_frame(f as u8, 44_100, 512, -512);
+        ogg.extend_from_slice(&wrap_ogg_page(hdr_type, granule, serial, 3 + f, &frame));
+    }
+    ogg
+}
+
+fn build_valid_opus_fixture(
+    title: &str,
+    artist: &str,
+    album: &str,
+    track_number: u32,
+    disc_number: u32,
+    genre: &str,
+    year: u32,
+    num_packets: u32,
+) -> Vec<u8> {
+    let serial = 0xCAFE_BABEu32;
+    // Packet 0: OpusHead (19 bytes)
+    let mut head = Vec::with_capacity(19);
+    head.extend_from_slice(b"OpusHead");
+    head.push(1); // version 1
+    head.push(2); // 2 channels
+    head.extend_from_slice(&0u16.to_le_bytes()); // pre_skip = 0
+    head.extend_from_slice(&48_000u32.to_le_bytes()); // input sample rate = 48000 Hz
+    head.extend_from_slice(&0i16.to_le_bytes()); // output gain = 0
+    head.push(0); // channel mapping family = 0
+
+    // Packet 1: OpusTags
+    let mut tags = Vec::new();
+    tags.extend_from_slice(b"OpusTags");
+    tags.extend_from_slice(&build_vorbis_comment_payload(&[
+        ("TITLE", title),
+        ("ARTIST", artist),
+        ("ALBUM", album),
+        ("TRACKNUMBER", &track_number.to_string()),
+        ("DISCNUMBER", &disc_number.to_string()),
+        ("GENRE", genre),
+        ("DATE", &year.to_string()),
+    ]));
+
+    let mut opus = Vec::new();
+    opus.extend_from_slice(&wrap_ogg_page(0x02, 0, serial, 0, &head));
+    opus.extend_from_slice(&wrap_ogg_page(0x00, 0, serial, 1, &tags));
+
+    // Each packet: config 15 (20ms = 960 samples at 48kHz), stereo (s=1), 1 frame (c=0): TOC byte = (15 << 3) | 0x04 = 0x7C
+    for p in 0..num_packets {
+        let is_last = p + 1 == num_packets;
+        let hdr_type = if is_last { 0x04 } else { 0x00 };
+        let granule = ((p + 1) as u64) * 960;
+        let pkt = [0x7Cu8, 0xFF, 0xFE, (p as u8).wrapping_mul(17)];
+        opus.extend_from_slice(&wrap_ogg_page(hdr_type, granule, serial, 2 + p, &pkt));
+    }
+    opus
+}
+
+#[test]
+fn commits_flac_ogg_and_opus_tracks_via_pure_rust_alac_transcoder_preserving_metadata_artwork_and_itunesdb_fields() {
+    let device_temp = TempDir::new().expect("create device temp dir");
+    let mount_path = device_temp.path().to_path_buf();
+
+    let adapter = FakeHardwareAdapter {
+        volumes: vec![MountedVolume {
+            mount_path: mount_path.clone(),
+            volume_name: "IPOD".to_string(),
+            total_bytes: 30_000_000_000,
+            free_bytes: 29_950_000_000,
+            usb_firewire_guid: None,
+        }],
+    };
+    let mut engine = PodLoaderEngine::new(adapter);
+    engine
+        .initialize_device(&mount_path, "Lossless iPod")
+        .expect("initialize device");
+
+    let host_temp = TempDir::new().expect("create host temp dir");
+    let artwork_png: Vec<u8> = vec![
+        0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0xAA, 0xBB, 0xCC, 0xDD,
+    ];
+
+    // 1. 48 kHz stereo FLAC file (12 frames * 4096 = 49152 samples -> 1024 ms) with Vorbis comments + Picture block
+    let flac_path = host_temp.path().join("01 - Everything In Its Right Place.flac");
+    let flac_bytes = build_valid_flac_fixture(
+        "Everything In Its Right Place",
+        "Radiohead",
+        "Kid A",
+        1,
+        2,
+        "Electronic",
+        2000,
+        48_000,
+        12,
+        &artwork_png,
+    );
+    fs::write(&flac_path, &flac_bytes).expect("write flac fixture");
+
+    // 2. 44.1 kHz stereo OGG file (11 frames * 4096 = 45056 samples -> ~1021 ms) with Vorbis comments + Picture block
+    let ogg_path = host_temp.path().join("02 - Kid A.ogg");
+    let ogg_bytes = build_valid_ogg_fixture(
+        "Kid A",
+        "Radiohead",
+        "Kid A",
+        2,
+        2,
+        "Electronic",
+        2000,
+        11,
+        &artwork_png,
+    );
+    fs::write(&ogg_path, &ogg_bytes).expect("write ogg fixture");
+
+    // 3. 48 kHz stereo Opus file (50 packets * 960 = 48000 samples -> 1000 ms) with OpusTags
+    let opus_path = host_temp.path().join("03 - The National Anthem.opus");
+    let opus_bytes = build_valid_opus_fixture(
+        "The National Anthem",
+        "Radiohead",
+        "Kid A",
+        3,
+        2,
+        "Post-Punk",
+        2000,
+        50,
+    );
+    fs::write(&opus_path, &opus_bytes).expect("write opus fixture");
+
+    // Stage all 3 files and commit Sync Batch
+    let batch = engine
+        .stage_host_paths(&[flac_path, ogg_path, opus_path], None)
+        .expect("stage lossless/ogg/opus files");
+    assert_eq!(batch.additions.len(), 3);
+    assert!(batch.additions.iter().all(|a| a.requires_transcode));
+
+    let outcome = engine.commit_sync_batch().expect("commit sync batch");
+    let session = match outcome {
+        CommitOutcome::Completed(s) => s,
+        other => panic!("expected Completed, got {:?}", other),
+    };
+
+    assert_eq!(session.library.tracks.len(), 3);
+
+    let t1 = &session.library.tracks[0];
+    assert_eq!(t1.title, "Everything In Its Right Place");
+    assert_eq!(t1.artist, "Radiohead");
+    assert_eq!(t1.album, "Kid A");
+    assert_eq!(t1.track_number, 1);
+    assert_eq!(t1.disc_number, 2);
+    assert_eq!(t1.genre, "Electronic");
+    assert_eq!(t1.year, 2000);
+    assert_eq!(t1.duration_ms, 1024);
+    assert!(t1.bitrate_kbps > 0);
+    assert!(
+        t1.obfuscated_path.ends_with(".m4a"),
+        "expected transcoded ALAC track at .m4a obfuscated path, got {}",
+        t1.obfuscated_path
+    );
+
+    let t2 = &session.library.tracks[1];
+    assert_eq!(t2.title, "Kid A");
+    assert_eq!(t2.artist, "Radiohead");
+    assert_eq!(t2.album, "Kid A");
+    assert_eq!(t2.track_number, 2);
+    assert_eq!(t2.disc_number, 2);
+    assert_eq!(t2.genre, "Electronic");
+    assert_eq!(t2.year, 2000);
+    assert_eq!(t2.duration_ms, 1021);
+    assert!(t2.obfuscated_path.ends_with(".m4a"));
+
+    let t3 = &session.library.tracks[2];
+    assert_eq!(t3.title, "The National Anthem");
+    assert_eq!(t3.artist, "Radiohead");
+    assert_eq!(t3.album, "Kid A");
+    assert_eq!(t3.track_number, 3);
+    assert_eq!(t3.disc_number, 2);
+    assert_eq!(t3.genre, "Post-Punk");
+    assert_eq!(t3.year, 2000);
+    assert_eq!(t3.duration_ms, 1000);
+    assert!(t3.obfuscated_path.ends_with(".m4a"));
+
+    // Verify the written .m4a files on the Device volume are valid ALAC containers with preserved tags and embedded artwork
+    for (idx, dt) in session.library.tracks.iter().enumerate() {
+        let rel = dt.obfuscated_path.trim_start_matches(':').replace(':', "/");
+        let disk_path = mount_path.join(rel);
+        assert!(disk_path.is_file(), "expected output .m4a file at {:?}", disk_path);
+        let m4a_bytes = fs::read(&disk_path).expect("read output .m4a");
+        assert!(
+            m4a_bytes.windows(4).any(|w| w == b"alac"),
+            "expected alac sample entry in .m4a container"
+        );
+        // Inspecting the output .m4a through browse_host_directory must read back all copied metadata tags
+        let parent_dir = disk_path.parent().expect("music folder");
+        let inspected = engine
+            .browse_host_directory(parent_dir)
+            .expect("browse output folder");
+        let matched = inspected
+            .files
+            .iter()
+            .find(|f| f.path == disk_path)
+            .expect("find output .m4a in directory listing");
+        assert_eq!(matched.format, "ALAC");
+        assert_eq!(matched.title, dt.title);
+        assert_eq!(matched.artist, dt.artist);
+        assert_eq!(matched.album, dt.album);
+        assert_eq!(matched.track_number, dt.track_number);
+        assert_eq!(matched.disc_number, dt.disc_number);
+        assert_eq!(matched.genre, dt.genre);
+        assert_eq!(matched.year, dt.year);
+
+        if idx < 2 {
+            // Tracks 1 and 2 had embedded PNG artwork; verify covr atom contains the artwork bytes
+            assert!(
+                m4a_bytes.windows(4).any(|w| w == b"covr"),
+                "expected covr artwork atom in transcoded .m4a"
+            );
+            assert!(
+                m4a_bytes
+                    .windows(artwork_png.len())
+                    .any(|w| w == artwork_png.as_slice()),
+                "expected embedded artwork payload preserved inside .m4a container"
+            );
+        }
+    }
+
+    // Verify iTunesDB mhit headers registered accurate sample rates (48000 << 16 for track 1, 44100 << 16 for track 2)
+    let itunesdb_bytes = fs::read(mount_path.join("iPod_Control/iTunes/iTunesDB")).expect("read iTunesDB");
+    let expected_sr_48k = (48_000u32 << 16).to_le_bytes();
+    let expected_sr_44k = (44_100u32 << 16).to_le_bytes();
+    assert!(
+        itunesdb_bytes.windows(4).any(|w| w == expected_sr_48k),
+        "expected 48 kHz fixed-point sample rate (48000 << 16) in iTunesDB mhit"
+    );
+    assert!(
+        itunesdb_bytes.windows(4).any(|w| w == expected_sr_44k),
+        "expected 44.1 kHz fixed-point sample rate (44100 << 16) in iTunesDB mhit"
+    );
+}
+
+struct ConfigurableTranscodeAdapter {
+    volumes: Vec<MountedVolume>,
+    ffmpeg_available: bool,
+}
+
+impl HardwareDeviceAdapter for ConfigurableTranscodeAdapter {
+    fn list_mounted_volumes(&self) -> Result<Vec<MountedVolume>, PodLoaderError> {
+        Ok(self.volumes.clone())
+    }
+
+    fn lookup_usb_firewire_guid(&self, mount_path: &std::path::Path) -> Option<String> {
+        self.volumes
+            .iter()
+            .find(|v| v.mount_path == mount_path)
+            .and_then(|v| v.usb_firewire_guid.clone())
+    }
+
+    fn is_ffmpeg_available(&self) -> bool {
+        self.ffmpeg_available
+    }
+
+    fn transcode_lossy(
+        &self,
+        _input_path: &std::path::Path,
+        output_path: &std::path::Path,
+        preset: TranscodePreset,
+        host_file: &podloader_core::HostFile,
+    ) -> Result<(), PodLoaderError> {
+        if !self.ffmpeg_available {
+            return Err(PodLoaderError::FfmpegUnavailable);
+        }
+        let duration_secs = (host_file.duration_ms / 1000).max(1);
+        let bytes = match preset {
+            TranscodePreset::Mp3 => build_id3v23_mp3_fixture(
+                &host_file.title,
+                &host_file.artist,
+                &host_file.album,
+                host_file.track_number,
+                &host_file.genre,
+                host_file.year,
+                duration_secs,
+            ),
+            TranscodePreset::Aac | TranscodePreset::Alac => build_m4a_alac_fixture(
+                &host_file.title,
+                &host_file.artist,
+                &host_file.album,
+                host_file.track_number as u16,
+                duration_secs,
+            ),
+        };
+        fs::write(output_path, bytes)?;
+        Ok(())
+    }
+}
+
+#[test]
+fn configures_per_device_transcode_presets_enforces_ffmpeg_availability_and_emits_commit_progress() {
+    let device_temp = TempDir::new().expect("create device temp dir");
+    let mount_path = device_temp.path().to_path_buf();
+
+    // 1. When ffmpeg is absent, lossy presets (AAC / MP3) are rejected while ALAC succeeds
+    let no_ffmpeg_adapter = ConfigurableTranscodeAdapter {
+        volumes: vec![MountedVolume {
+            mount_path: mount_path.clone(),
+            volume_name: "IPOD".to_string(),
+            total_bytes: 30_000_000_000,
+            free_bytes: 29_950_000_000,
+            usb_firewire_guid: None,
+        }],
+        ffmpeg_available: false,
+    };
+    let mut engine_no_ffmpeg = PodLoaderEngine::new(no_ffmpeg_adapter);
+    let init_state = engine_no_ffmpeg
+        .initialize_device(&mount_path, "Preset iPod")
+        .expect("init device");
+    match init_state {
+        DeviceConnectionState::Connected(s) => {
+            assert!(!s.ffmpeg_available);
+            assert_eq!(s.transcode_preset, TranscodePreset::Alac);
+        }
+        other => panic!("expected Connected, got {:?}", other),
+    }
+
+    let err = engine_no_ffmpeg
+        .set_transcode_preset(TranscodePreset::Aac)
+        .expect_err("expected FfmpegUnavailable when selecting AAC without ffmpeg");
+    assert!(matches!(err, PodLoaderError::FfmpegUnavailable));
+
+    // 2. When ffmpeg is available, switching to MP3 updates staged transcodable tracks and commits with progress
+    let with_ffmpeg_adapter = ConfigurableTranscodeAdapter {
+        volumes: vec![MountedVolume {
+            mount_path: mount_path.clone(),
+            volume_name: "IPOD".to_string(),
+            total_bytes: 30_000_000_000,
+            free_bytes: 29_950_000_000,
+            usb_firewire_guid: None,
+        }],
+        ffmpeg_available: true,
+    };
+    let mut engine = PodLoaderEngine::new(with_ffmpeg_adapter);
+    engine.scan_device().expect("scan device");
+
+    let host_temp = TempDir::new().expect("create host temp dir");
+    let flac_path = host_temp.path().join("01 - Airbag.flac");
+    let flac_bytes = build_valid_flac_fixture(
+        "Airbag",
+        "Radiohead",
+        "OK Computer",
+        1,
+        1,
+        "Alternative",
+        1997,
+        44_100,
+        10,
+        &[],
+    );
+    fs::write(&flac_path, &flac_bytes).expect("write flac");
+
+    let mp3_path = host_temp.path().join("02 - Paranoid Android.mp3");
+    fs::write(
+        &mp3_path,
+        build_id3v23_mp3_fixture(
+            "Paranoid Android",
+            "Radiohead",
+            "OK Computer",
+            2,
+            "Alternative",
+            1997,
+            4,
+        ),
+    )
+    .expect("write mp3");
+
+    let batch = engine
+        .stage_host_paths(&[flac_path, mp3_path], None)
+        .expect("stage tracks");
+    assert_eq!(batch.additions[0].target_format, Some(TranscodePreset::Alac));
+    assert_eq!(batch.additions[1].target_format, None);
+
+    // Switch device preset to MP3 -> staged FLAC track updates to Some(TranscodePreset::Mp3), native MP3 stays None
+    let updated_session = engine
+        .set_transcode_preset(TranscodePreset::Mp3)
+        .expect("set MP3 preset");
+    assert_eq!(updated_session.transcode_preset, TranscodePreset::Mp3);
+    assert!(updated_session.ffmpeg_available);
+    assert_eq!(
+        updated_session.sync_batch.additions[0].target_format,
+        Some(TranscodePreset::Mp3)
+    );
+    assert_eq!(updated_session.sync_batch.additions[1].target_format, None);
+
+    // Commit with progress callback and verify per-track & overall progress events
+    let mut progress_events: Vec<TransferProgress> = Vec::new();
+    let outcome = engine
+        .commit_sync_batch_with_progress(None, |prog| {
+            progress_events.push(prog);
+        })
+        .expect("commit with progress");
+
+    let final_session = match outcome {
+        CommitOutcome::Completed(s) => s,
+        other => panic!("expected Completed, got {:?}", other),
+    };
+    assert_eq!(final_session.library.tracks.len(), 2);
+    assert!(
+        final_session.library.tracks[0]
+            .obfuscated_path
+            .ends_with(".mp3"),
+        "expected FLAC track transcoded to .mp3 under MP3 preset, got {}",
+        final_session.library.tracks[0].obfuscated_path
+    );
+
+    assert!(
+        !progress_events.is_empty(),
+        "expected progress events during commit"
+    );
+    assert!(progress_events
+        .iter()
+        .any(|p| p.current_track_title == "Airbag" && p.is_transcoding));
+    assert!(progress_events
+        .iter()
+        .any(|p| p.current_track_title == "Paranoid Android" && !p.is_transcoding));
+    let last_event = progress_events.last().expect("last progress event");
+    assert_eq!(last_event.total_tracks, 2);
+    assert_eq!(last_event.track_percent, 100);
+    assert_eq!(last_event.overall_percent, 100);
+}
+
+
+
 
 
 

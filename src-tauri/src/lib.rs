@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use podloader_core::{
     CommitOutcome, DeviceConnectionState, DeviceSession, DuplicateResolution,
     HardwareDeviceAdapter, HostDirectoryListing, InterruptedResolution, PodLoaderEngine,
-    SyncBatch, SystemHardwareDeviceAdapter,
+    SyncBatch, SystemHardwareDeviceAdapter, TranscodePreset,
 };
 
 pub struct AppState<A: HardwareDeviceAdapter = SystemHardwareDeviceAdapter> {
@@ -95,6 +95,13 @@ impl<A: HardwareDeviceAdapter> AppState<A> {
         let mut guard = self.engine.lock().map_err(|e| e.to_string())?;
         guard
             .set_manual_firewire_guid(guid)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn set_transcode_preset(&self, preset: TranscodePreset) -> Result<DeviceSession, String> {
+        let mut guard = self.engine.lock().map_err(|e| e.to_string())?;
+        guard
+            .set_transcode_preset(preset)
             .map_err(|e| e.to_string())
     }
 }

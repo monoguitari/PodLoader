@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use crate::{HostDirectoryEntry, HostDirectoryListing, HostFile, PodLoaderError};
 
-const SUPPORTED_EXTENSIONS: &[&str] = &["mp3", "m4a", "aac", "alac", "wav"];
+const SUPPORTED_EXTENSIONS: &[&str] = &[
+    "mp3", "m4a", "aac", "alac", "wav", "flac", "ogg", "opus",
+];
 
 pub fn is_supported_audio_path(path: &Path) -> bool {
     path.extension()
@@ -20,6 +22,13 @@ pub fn is_native_ipod_format(format: &str) -> bool {
     matches!(
         format.to_ascii_uppercase().as_str(),
         "MP3" | "AAC" | "ALAC" | "M4A" | "WAV"
+    )
+}
+
+pub fn is_transcodable_format(format: &str) -> bool {
+    matches!(
+        format.to_ascii_uppercase().as_str(),
+        "FLAC" | "OGG" | "OPUS"
     )
 }
 
@@ -130,10 +139,57 @@ pub fn inspect_host_file(path: &Path) -> Result<HostFile, PodLoaderError> {
         "MP3" => parse_mp3_metadata(&bytes, &mut host_file),
         "WAV" => parse_wav_metadata(&bytes, &mut host_file),
         "M4A" | "AAC" | "ALAC" => parse_mp4_metadata(&bytes, &mut host_file),
+        "FLAC" | "OGG" | "OPUS" => parse_symphonia_host_metadata(path, &mut host_file),
         _ => {}
     }
 
     Ok(host_file)
+}
+
+fn parse_symphonia_host_metadata(path: &Path, file: &mut HostFile) {
+    if let Ok(meta) = crate::transcode::inspect_symphonia_metadata(path, file.file_size) {
+        if let Some(title) = meta.title {
+            if !title.is_empty() {
+                file.title = title;
+            }
+        }
+        if let Some(artist) = meta.artist {
+            if !artist.is_empty() {
+                file.artist = artist;
+            }
+        }
+        if let Some(album) = meta.album {
+            if !album.is_empty() {
+                file.album = album;
+            }
+        }
+        if let Some(track_number) = meta.track_number {
+            if track_number > 0 {
+                file.track_number = track_number;
+            }
+        }
+        if let Some(disc_number) = meta.disc_number {
+            if disc_number > 0 {
+                file.disc_number = disc_number;
+            }
+        }
+        if let Some(genre) = meta.genre {
+            if !genre.is_empty() {
+                file.genre = genre;
+            }
+        }
+        if let Some(year) = meta.year {
+            if year > 0 {
+                file.year = year;
+            }
+        }
+        if meta.duration_ms > 0 {
+            file.duration_ms = meta.duration_ms;
+        }
+        if meta.bitrate_kbps > 0 {
+            file.bitrate_kbps = meta.bitrate_kbps;
+        }
+    }
 }
 
 fn parse_stem_track_and_title(path: &Path) -> (Option<u32>, String) {

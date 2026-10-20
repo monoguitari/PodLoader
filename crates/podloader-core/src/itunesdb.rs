@@ -324,6 +324,7 @@ impl ItunesDb {
         obfuscated_path: &str,
         replace_track_id: Option<u32>,
         target_playlist_id: Option<u64>,
+        sample_rate_hz: Option<u32>,
     ) -> (u32, Option<String>) {
         if let Some(existing_id) = replace_track_id {
             for ds in &mut self.datasets {
@@ -341,7 +342,7 @@ impl ItunesDb {
                         chunk.track.bitrate_kbps = host_file.bitrate_kbps;
                         chunk.track.obfuscated_path = obfuscated_path.to_string();
 
-                        write_mhit_track_metadata(&mut chunk.header_bytes, host_file);
+                        write_mhit_track_metadata(&mut chunk.header_bytes, host_file, sample_rate_hz);
 
                         // Preserve unknown mhods (types outside 1..=6, 22) while updating string mhods
                         let preserved: Vec<MhodChunk> = chunk
@@ -366,8 +367,13 @@ impl ItunesDb {
             MhsdBody::TrackList { tracks, .. } => tracks.first().map(|t| t.header_bytes.clone()),
             _ => None,
         });
-        let new_chunk =
-            build_new_mhit_chunk(new_id, host_file, obfuscated_path, template_header.as_deref());
+        let new_chunk = build_new_mhit_chunk(
+            new_id,
+            host_file,
+            obfuscated_path,
+            template_header.as_deref(),
+            sample_rate_hz,
+        );
         let mut new_track_idx = 0usize;
         for ds in &mut self.datasets {
             if let MhsdBody::TrackList { tracks, .. } = &mut ds.body {
@@ -779,7 +785,11 @@ fn build_track_string_mhods(host_file: &HostFile, obfuscated_path: &str) -> Vec<
     ]
 }
 
-fn write_mhit_track_metadata(header_bytes: &mut [u8], host_file: &HostFile) {
+fn write_mhit_track_metadata(
+    header_bytes: &mut [u8],
+    host_file: &HostFile,
+    sample_rate_hz: Option<u32>,
+) {
     if header_bytes.len() >= 96 {
         let fmt = host_file.format.to_ascii_uppercase();
         let (filetype_magic, type1, type2): (&[u8; 4], u8, u8) = match fmt.as_str() {
@@ -795,8 +805,10 @@ fn write_mhit_track_metadata(header_bytes: &mut [u8], host_file: &HostFile) {
         header_bytes[44..48].copy_from_slice(&host_file.track_number.to_le_bytes());
         header_bytes[52..56].copy_from_slice(&host_file.year.to_le_bytes());
         header_bytes[56..60].copy_from_slice(&host_file.bitrate_kbps.to_le_bytes());
-        // Default 44.1 kHz fixed-point sample rate (44100 << 16 = 0xAC440000) if unset
-        if header_bytes[60..64] == [0, 0, 0, 0] {
+        if let Some(sr) = sample_rate_hz.filter(|&s| s > 0) {
+            let sr_fixed = sr.min(65535) << 16;
+            header_bytes[60..64].copy_from_slice(&sr_fixed.to_le_bytes());
+        } else if header_bytes[60..64] == [0, 0, 0, 0] {
             header_bytes[60..64].copy_from_slice(&0xAC440000u32.to_le_bytes());
         }
         header_bytes[92..96].copy_from_slice(&host_file.disc_number.to_le_bytes());
@@ -818,6 +830,7 @@ fn build_new_mhit_chunk(
     host_file: &HostFile,
     obfuscated_path: &str,
     template_header: Option<&[u8]>,
+    sample_rate_hz: Option<u32>,
 ) -> MhitChunk {
     let mhods = build_track_string_mhods(host_file, obfuscated_path);
     let header_len = template_header.map(|t| t.len() as u32).unwrap_or(244u32);
@@ -854,7 +867,7 @@ fn build_new_mhit_chunk(
     if header_bytes.len() >= 176 {
         header_bytes[168..176].copy_from_slice(&dbid.to_le_bytes());
     }
-    write_mhit_track_metadata(&mut header_bytes, host_file);
+    write_mhit_track_metadata(&mut header_bytes, host_file, sample_rate_hz);
 
     MhitChunk {
         header_bytes,

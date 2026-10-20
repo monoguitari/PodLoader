@@ -10,6 +10,7 @@ import type {
   InterruptedResolution,
   PodLoaderBridge,
   SyncBatch,
+  TranscodePreset,
 } from "./bridge";
 
 declare global {
@@ -144,6 +145,15 @@ const defaultBridge: PodLoaderBridge = {
       );
     }
     return postJson<DeviceSession>("/api/set_manual_firewire_guid", { guid });
+  },
+  async setTranscodePreset(preset: TranscodePreset): Promise<DeviceSession> {
+    if (window.__TAURI_INTERNALS__) {
+      return window.__TAURI_INTERNALS__.invoke<DeviceSession>(
+        "set_transcode_preset",
+        { preset },
+      );
+    }
+    return postJson<DeviceSession>("/api/set_transcode_preset", { preset });
   },
 };
 

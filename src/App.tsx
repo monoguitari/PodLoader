@@ -9,6 +9,8 @@ import type {
   InterruptedResolution,
   PodLoaderBridge,
   SyncBatch,
+  TranscodePreset,
+  TransferProgress,
 } from "./bridge";
 
 export interface AppProps {
@@ -118,6 +120,8 @@ export function App({ bridge }: AppProps) {
   });
   const [interruptedBatch, setInterruptedBatch] =
     useState<InterruptedBatchSummary | null>(null);
+  const [transferProgress, setTransferProgress] =
+    useState<TransferProgress | null>(null);
   const [manualGuidInput, setManualGuidInput] = useState<string>("");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
@@ -263,7 +267,7 @@ export function App({ bridge }: AppProps) {
       setSyncBatch(updatedBatch);
       if (updatedBatch.additions.length === prevCount) {
         setErrorMessage(
-          "No new iPod-native audio files (MP3, M4A, AAC, ALAC, WAV) were found to stage in the selected path.",
+          "No supported audio files (MP3, M4A, AAC, ALAC, WAV, FLAC, OGG, Opus) were found to stage in the selected path.",
         );
       } else {
         setErrorMessage(null);
@@ -299,14 +303,29 @@ export function App({ bridge }: AppProps) {
     }
   };
 
+  const handleTranscodePresetChange = async (preset: TranscodePreset) => {
+    if (!bridge.setTranscodePreset) return;
+    try {
+      const updatedSession = await bridge.setTranscodePreset(preset);
+      applyConnectionState({ status: "connected", data: updatedSession });
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
+
   const handleCommitBatch = async (maxTracksBeforeInterrupt?: number) => {
     if (!bridge.commitSyncBatch) return;
     try {
-      const outcome = await bridge.commitSyncBatch(
-        maxTracksBeforeInterrupt !== undefined
+      const outcome = await bridge.commitSyncBatch({
+        ...(maxTracksBeforeInterrupt !== undefined
           ? { maxTracksBeforeInterrupt }
-          : undefined,
-      );
+          : {}),
+        onProgress: (progress) => {
+          setTransferProgress(progress);
+        },
+      });
+      setTransferProgress(null);
       if (outcome.outcome === "completed") {
         applyConnectionState({ status: "connected", data: outcome.data });
       } else {
@@ -314,6 +333,7 @@ export function App({ bridge }: AppProps) {
       }
       setErrorMessage(null);
     } catch (err) {
+      setTransferProgress(null);
       setErrorMessage(err instanceof Error ? err.message : String(err));
     }
   };
@@ -353,6 +373,36 @@ export function App({ bridge }: AppProps) {
             <button type="button" onClick={handleSaveManualGuid}>
               Save GUID
             </button>
+          </div>
+          <div className="transcode-preset-controls">
+            <label htmlFor="transcode-preset-select">Transcode Preset</label>
+            <select
+              id="transcode-preset-select"
+              aria-label="Transcode Preset"
+              value={connection.data.transcodePreset ?? "alac"}
+              onChange={(e) =>
+                handleTranscodePresetChange(e.target.value as TranscodePreset)
+              }
+            >
+              <option value="alac">Lossless ALAC (Pure Rust)</option>
+              <option
+                value="aac"
+                disabled={connection.data.ffmpegAvailable === false}
+              >
+                Lossy AAC (ffmpeg)
+              </option>
+              <option
+                value="mp3"
+                disabled={connection.data.ffmpegAvailable === false}
+              >
+                Lossy MP3 (ffmpeg)
+              </option>
+            </select>
+            {connection.data.ffmpegAvailable === false && (
+              <span className="ffmpeg-unavailable-hint">
+                ffmpeg not detected on PATH; lossy AAC/MP3 presets disabled
+              </span>
+            )}
           </div>
         </div>
         <div className="storage-summary">
@@ -553,36 +603,61 @@ export function App({ bridge }: AppProps) {
                 </div>
               )}
 
+              {transferProgress && (
+                <div role="status" className="transfer-progress-banner">
+                  <p>
+                    {transferProgress.isTranscoding
+                      ? "Transcoding"
+                      : "Transferring"}{" "}
+                    Track {transferProgress.currentTrackIndex} of{" "}
+                    {transferProgress.totalTracks}:{" "}
+                    {transferProgress.currentTrackTitle} (
+                    {transferProgress.trackPercent}%)
+                  </p>
+                  <p>Overall Progress: {transferProgress.overallPercent}%</p>
+                </div>
+              )}
+
               <ul>
-                {syncBatch.additions.map((item) => (
-                  <li key={item.stagedId}>
-                    <span>
-                      {item.hostFile.artist} — {item.hostFile.title} (
-                      {item.hostFile.format})
-                    </span>
-                    {item.isDuplicate && (
-                      <>
-                        <span className="duplicate-badge">Duplicate</span>
-                        <select
-                          aria-label={`Duplicate resolution for ${item.hostFile.title}`}
-                          value={item.duplicateResolution}
-                          onChange={(e) =>
-                            handleDuplicateResolutionChange(
-                              item.stagedId,
-                              e.target.value as DuplicateResolution,
-                            )
-                          }
-                        >
-                          <option value="skip">Skip</option>
-                          <option value="importAnyway">Import Anyway</option>
-                          <option value="replaceExisting">
-                            Replace Existing
-                          </option>
-                        </select>
-                      </>
-                    )}
-                  </li>
-                ))}
+                {syncBatch.additions.map((item) => {
+                  const targetFmt = (
+                    item.targetFormat ??
+                    connection.data.transcodePreset ??
+                    "alac"
+                  ).toUpperCase();
+                  return (
+                    <li key={item.stagedId}>
+                      <span>
+                        {item.hostFile.artist} — {item.hostFile.title} (
+                        {item.requiresTranscode
+                          ? `${item.hostFile.format} → ${targetFmt}`
+                          : item.hostFile.format}
+                        )
+                      </span>
+                      {item.isDuplicate && (
+                        <>
+                          <span className="duplicate-badge">Duplicate</span>
+                          <select
+                            aria-label={`Duplicate resolution for ${item.hostFile.title}`}
+                            value={item.duplicateResolution}
+                            onChange={(e) =>
+                              handleDuplicateResolutionChange(
+                                item.stagedId,
+                                e.target.value as DuplicateResolution,
+                              )
+                            }
+                          >
+                            <option value="skip">Skip</option>
+                            <option value="importAnyway">Import Anyway</option>
+                            <option value="replaceExisting">
+                              Replace Existing
+                            </option>
+                          </select>
+                        </>
+                      )}
+                    </li>
+                  );
+                })}
               </ul>
 
               <div className="sync-batch-actions">

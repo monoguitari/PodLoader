@@ -2,7 +2,9 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use podloader_core::{DeviceConnectionState, DuplicateResolution, InterruptedResolution};
+use podloader_core::{
+    DeviceConnectionState, DuplicateResolution, InterruptedResolution, TranscodePreset,
+};
 use podloader_shell::AppState;
 
 fn main() {
@@ -233,6 +235,13 @@ fn handle_http_client(mut stream: std::net::TcpStream, state: &AppState) -> std:
     } else if first_line.starts_with("POST /api/set_manual_firewire_guid") {
         let guid = parsed["guid"].as_str().unwrap_or("");
         match state.set_manual_firewire_guid(guid) {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("POST /api/set_transcode_preset") {
+        let preset: TranscodePreset = serde_json::from_value(parsed["preset"].clone())
+            .unwrap_or(TranscodePreset::Alac);
+        match state.set_transcode_preset(preset) {
             Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
             Err(e) => serde_json::json!({ "error": e }).to_string(),
         }

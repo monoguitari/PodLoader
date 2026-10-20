@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, test } from "vitest";
 import { App } from "./App";
@@ -12,6 +12,8 @@ import type {
   InterruptedResolution,
   PodLoaderBridge,
   SyncBatch,
+  TranscodePreset,
+  TransferProgress,
 } from "./bridge";
 
 class InMemoryPodLoaderBridge implements PodLoaderBridge {
@@ -101,6 +103,10 @@ class InMemoryPodLoaderBridge implements PodLoaderBridge {
           dt.trackNumber === hf.trackNumber,
       );
       const isDuplicate = Boolean(existing);
+      const requiresTranscode = ["FLAC", "OGG", "OPUS"].includes(
+        hf.format.toUpperCase(),
+      );
+      const activePreset = session.transcodePreset ?? "alac";
       batch.additions.push({
         stagedId: this.nextStagedId++,
         hostFile: hf,
@@ -108,6 +114,8 @@ class InMemoryPodLoaderBridge implements PodLoaderBridge {
         isDuplicate,
         matchedDeviceTrackId: existing?.id ?? null,
         duplicateResolution: isDuplicate ? "skip" : "importAnyway",
+        requiresTranscode,
+        targetFormat: requiresTranscode ? activePreset : null,
       });
     }
 
@@ -139,6 +147,7 @@ class InMemoryPodLoaderBridge implements PodLoaderBridge {
 
   async commitSyncBatch(options?: {
     maxTracksBeforeInterrupt?: number;
+    onProgress?: (progress: TransferProgress) => void;
   }): Promise<CommitOutcome> {
     if (this.state.status !== "connected") {
       throw new Error("No active device");
@@ -270,6 +279,28 @@ class InMemoryPodLoaderBridge implements PodLoaderBridge {
       throw new Error("No active device");
     }
     this.state.data.device.firewireGuid = guid;
+    return { ...this.state.data };
+  }
+
+  async setTranscodePreset(preset: TranscodePreset): Promise<DeviceSession> {
+    if (this.state.status !== "connected") {
+      throw new Error("No active device");
+    }
+    if (
+      (preset === "aac" || preset === "mp3") &&
+      this.state.data.ffmpegAvailable === false
+    ) {
+      throw new Error("System ffmpeg is required for lossy AAC/MP3 transcoding");
+    }
+    this.state.data.transcodePreset = preset;
+    if (this.state.data.syncBatch) {
+      this.state.data.syncBatch = {
+        ...this.state.data.syncBatch,
+        additions: this.state.data.syncBatch.additions.map((a) =>
+          a.requiresTranscode ? { ...a, targetFormat: preset } : a,
+        ),
+      };
+    }
     return { ...this.state.data };
   }
 }
@@ -633,5 +664,185 @@ describe("PodLoaderBridge React UI Seam", () => {
     expect(
       await within(deviceTable).findByText("Karma Police"),
     ).toBeInTheDocument();
+  });
+
+  test("stages FLAC/OGG files for transcoding, manages per-Device transcoding presets with ffmpeg availability, and displays live per-track and overall progress during commit", async () => {
+    const user = userEvent.setup();
+    let resolvePendingCommit: ((outcome: CommitOutcome) => void) | null = null;
+
+    const bridge = new InMemoryPodLoaderBridge(
+      {
+        status: "connected",
+        data: {
+          device: {
+            mountPath: "/Volumes/IPOD_CLASSIC",
+            name: "Classic 160GB",
+            modelNumber: "MC297",
+            firewireGuid: "000A270011223344",
+            totalBytes: 160_000_000_000,
+            freeBytes: 120_000_000_000,
+            usedBytes: 40_000_000_000,
+          },
+          library: {
+            tracks: [],
+            playlists: [
+              {
+                id: 1000,
+                name: "Classic 160GB",
+                kind: "master",
+                trackIds: [],
+              },
+            ],
+          },
+          hasPendingPlayCounts: false,
+          syncBatch: { additions: [], requiredBytes: 0 },
+          interruptedBatch: null,
+          transcodePreset: "alac",
+          ffmpegAvailable: false,
+        },
+      },
+      {
+        currentPath: "/music/Kid A",
+        parentPath: "/music",
+        subdirectories: [],
+        files: [
+          {
+            path: "/music/Kid A/01 - Everything In Its Right Place.flac",
+            fileName: "01 - Everything In Its Right Place.flac",
+            format: "FLAC",
+            fileSize: 24_000_000,
+            title: "Everything In Its Right Place",
+            artist: "Radiohead",
+            album: "Kid A",
+            trackNumber: 1,
+            discNumber: 1,
+            genre: "Electronic",
+            year: 2000,
+            durationMs: 251_000,
+            bitrateKbps: 850,
+          },
+          {
+            path: "/music/Kid A/02 - Kid A.ogg",
+            fileName: "02 - Kid A.ogg",
+            format: "OGG",
+            fileSize: 8_000_000,
+            title: "Kid A",
+            artist: "Radiohead",
+            album: "Kid A",
+            trackNumber: 2,
+            discNumber: 1,
+            genre: "Electronic",
+            year: 2000,
+            durationMs: 284_000,
+            bitrateKbps: 225,
+          },
+          {
+            path: "/music/Kid A/04 - How to Disappear Completely.mp3",
+            fileName: "04 - How to Disappear Completely.mp3",
+            format: "MP3",
+            fileSize: 9_000_000,
+            title: "How to Disappear Completely",
+            artist: "Radiohead",
+            album: "Kid A",
+            trackNumber: 4,
+            discNumber: 1,
+            genre: "Electronic",
+            year: 2000,
+            durationMs: 356_000,
+            bitrateKbps: 320,
+          },
+        ],
+      },
+    );
+
+    const originalCommit = bridge.commitSyncBatch.bind(bridge);
+    bridge.commitSyncBatch = (options) => {
+      options?.onProgress?.({
+        currentTrackIndex: 1,
+        totalTracks: 3,
+        currentTrackTitle: "Everything In Its Right Place",
+        isTranscoding: true,
+        trackPercent: 50,
+        overallPercent: 17,
+      });
+      return new Promise<CommitOutcome>((resolve) => {
+        resolvePendingCommit = async () => {
+          const outcome = await originalCommit(options);
+          resolve(outcome);
+        };
+      });
+    };
+
+    render(<App bridge={bridge} />);
+
+    // 1. Verify per-Device Transcoding Preset selector defaults to ALAC and disables AAC/MP3 with explanatory message when ffmpeg is absent
+    const presetSelect = await screen.findByLabelText(/Transcode Preset/i);
+    expect(presetSelect).toHaveValue("alac");
+    const aacOption = within(presetSelect).getByRole("option", {
+      name: /AAC/i,
+    }) as HTMLOptionElement;
+    const mp3Option = within(presetSelect).getByRole("option", {
+      name: /MP3/i,
+    }) as HTMLOptionElement;
+    expect(aacOption.disabled).toBe(true);
+    expect(mp3Option.disabled).toBe(true);
+    expect(
+      screen.getByText(/ffmpeg not detected on PATH/i),
+    ).toBeInTheDocument();
+
+    // 2. Stage FLAC, OGG, and native MP3 files
+    await user.click(
+      screen.getByRole("button", { name: /Stage All to Sync Batch/i }),
+    );
+    const syncBatchRegion = await screen.findByRole("region", {
+      name: /Sync Batch/i,
+    });
+    expect(
+      within(syncBatchRegion).getByText(/FLAC → ALAC/i),
+    ).toBeInTheDocument();
+    expect(
+      within(syncBatchRegion).getByText(/OGG → ALAC/i),
+    ).toBeInTheDocument();
+
+    // 3. Enable ffmpeg on the Device and switch preset to AAC -> staged transcode badges update to AAC
+    if (bridge.state.status === "connected") {
+      bridge.state.data.ffmpegAvailable = true;
+    }
+    aacOption.disabled = false;
+    await user.selectOptions(presetSelect, "aac");
+    expect(
+      await within(syncBatchRegion).findByText(/FLAC → AAC/i),
+    ).toBeInTheDocument();
+    expect(
+      within(syncBatchRegion).getByText(/OGG → AAC/i),
+    ).toBeInTheDocument();
+
+    // 4. Trigger Commit Sync Batch and verify live per-track & overall progress UI
+    await user.click(
+      within(syncBatchRegion).getByRole("button", {
+        name: /Commit Sync Batch/i,
+      }),
+    );
+
+    expect(
+      await within(syncBatchRegion).findByText(
+        /Transcoding Track 1 of 3: Everything In Its Right Place \(50%\)/i,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(syncBatchRegion).getByText(/Overall Progress: 17%/i),
+    ).toBeInTheDocument();
+
+    // Finish commit and verify tracks are added to Device Library
+    expect(resolvePendingCommit).not.toBeNull();
+    await act(async () => {
+      await resolvePendingCommit!(null as unknown as CommitOutcome);
+    });
+
+    const deviceTable = screen.getByRole("table", { name: /Device Tracks/i });
+    expect(
+      await within(deviceTable).findByText("Everything In Its Right Place"),
+    ).toBeInTheDocument();
+    expect(within(deviceTable).getAllByText("Kid A")).toHaveLength(4);
   });
 });
