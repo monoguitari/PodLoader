@@ -34,6 +34,59 @@ pub fn parse_firewire_guid_bytes(guid_str: &str) -> Result<[u8; 8], PodLoaderErr
     Ok(FireWireGuid::parse(guid_str)?.0)
 }
 
+/// Extract `(iv, random_bytes)` from an existing valid `iTunesDB` that contains a `hash72` signature
+/// (`itdb_hash72.c` `hash_extract`). Allows re-signing `hash72` without needing a `FireWireGuid`.
+pub fn extract_hash72_params(original_db_bytes: &[u8]) -> Option<([u8; 16], [u8; 12])> {
+    if original_db_bytes.len() < 0xA0 || original_db_bytes.get(0..4) != Some(b"mhbd") {
+        return None;
+    }
+    let sig = &original_db_bytes[0x72..0x72 + 46];
+    if sig[0] != 0x01 || sig[1] != 0x00 {
+        return None;
+    }
+    let sha1 = compute_itunesdb_sha1_for_hash72(original_db_bytes);
+    let mut plaintext = [0u8; 32];
+    plaintext[0..20].copy_from_slice(&sha1);
+    plaintext[20..32].copy_from_slice(&sig[2..14]);
+
+    let round_keys = aes128_expand_key(&HASH72_AES_KEY);
+    let c0: [u8; 16] = sig[14..30].try_into().ok()?;
+    let c1: [u8; 16] = sig[30..46].try_into().ok()?;
+
+    let d0 = aes128_decrypt_block(&c0, &round_keys);
+    let d1 = aes128_decrypt_block(&c1, &round_keys);
+
+    let mut out1 = [0u8; 16];
+    for i in 0..16 {
+        out1[i] = d1[i] ^ c0[i];
+    }
+    if out1 != plaintext[16..32] {
+        return None;
+    }
+
+    let mut iv = [0u8; 16];
+    for i in 0..16 {
+        iv[i] = d0[i] ^ plaintext[i];
+    }
+    let mut rand12 = [0u8; 12];
+    rand12.copy_from_slice(&sig[2..14]);
+    Some((iv, rand12))
+}
+
+/// Re-sign `hash72` at `0x72..0xA0` using `(iv, random_bytes)` extracted from the original `iTunesDB`.
+pub fn resign_itunesdb_hash72_with_params(
+    db_bytes: &mut [u8],
+    iv: &[u8; 16],
+    random_bytes: &[u8; 12],
+) {
+    if db_bytes.len() < 0xA0 || db_bytes.get(0..4) != Some(b"mhbd") {
+        return;
+    }
+    let sha1 = compute_itunesdb_sha1_for_hash72(db_bytes);
+    let hash72 = generate_hash72(&sha1, iv, random_bytes);
+    db_bytes[0x72..0x72 + 46].copy_from_slice(&hash72);
+}
+
 pub fn sign_itunesdb(db_bytes: &mut [u8], firewire_guid_hex: &str) -> Result<(), PodLoaderError> {
     let guid = FireWireGuid::parse(firewire_guid_hex)?;
     if db_bytes.len() < 0xA0 || db_bytes.get(0..4) != Some(b"mhbd") {
@@ -42,9 +95,32 @@ pub fn sign_itunesdb(db_bytes: &mut [u8], firewire_guid_hex: &str) -> Result<(),
         ));
     }
 
-    let (hash58, hash72) = compute_hashes(db_bytes, &guid);
-    db_bytes[0x58..0x58 + 20].copy_from_slice(&hash58);
+    // 1. Extract existing hash72 params (if any) before mutating header fields
+    let (iv, rand12) = extract_hash72_params(db_bytes).unwrap_or_else(|| {
+        let mut r = [0u8; 12];
+        r[0..8].copy_from_slice(&guid.0);
+        r[8..12].copy_from_slice(&guid.0[0..4]);
+        let mut i = [0u8; 16];
+        i[0..8].copy_from_slice(&guid.0);
+        i[8..16].copy_from_slice(&guid.0);
+        (i, r)
+    });
+
+    // 2. Ensure hashing_scheme is non-zero before computing hash72 & hash58
+    if db_bytes[0x30] == 0 && db_bytes[0x31] == 0 {
+        db_bytes[0x30] = 1;
+        db_bytes[0x31] = 0;
+    }
+
+    // 3. Write hash72 first so hash58 covers the final hash72 bytes at 0x72..0xA0
+    let sha1_72 = compute_itunesdb_sha1_for_hash72(db_bytes);
+    let hash72 = generate_hash72(&sha1_72, &iv, &rand12);
     db_bytes[0x72..0x72 + 46].copy_from_slice(&hash72);
+
+    // 4. Compute and write hash58
+    let hash58 = compute_hash58(db_bytes, &guid);
+    db_bytes[0x58..0x58 + 20].copy_from_slice(&hash58);
+
     Ok(())
 }
 
@@ -55,109 +131,14 @@ pub fn verify_itunesdb_signatures(db_bytes: &[u8], firewire_guid_hex: &str) -> b
     if db_bytes.len() < 0xA0 || db_bytes.get(0..4) != Some(b"mhbd") {
         return false;
     }
-    let (expected_58, expected_72) = compute_hashes(db_bytes, &guid);
-    db_bytes[0x58..0x58 + 20] == expected_58 && db_bytes[0x72..0x72 + 46] == expected_72
+    let expected_58 = compute_hash58(db_bytes, &guid);
+    let hash58_ok = db_bytes[0x58..0x58 + 20] == expected_58;
+    let hash72_ok = extract_hash72_params(db_bytes).is_some();
+    hash58_ok && hash72_ok
 }
 
-const HASH58_FIXED_SALT: [u8; 16] = [
-    0x61, 0x6C, 0x74, 0x7A, 0x7A, 0x39, 0x62, 0x6E, 0x6B, 0x32, 0x39, 0x72, 0x76, 0x31, 0x30, 0x70,
-];
-
-const HASH72_AES_KEY: [u8; 16] = [
-    0x61, 0x8C, 0xA1, 0x0D, 0xC7, 0xF5, 0x7F, 0xD3, 0xB4, 0x72, 0x3E, 0x08, 0x15, 0x74, 0x63, 0xD7,
-];
-
-fn gcd_u8(mut a: u8, mut b: u8) -> u8 {
-    while b != 0 {
-        let t = b;
-        b = a % b;
-        a = t;
-    }
-    a.max(1)
-}
-
-fn lcm_u8(a: u8, b: u8) -> u8 {
-    if a == 0 || b == 0 {
-        return 1;
-    }
-    let g = gcd_u8(a, b) as u16;
-    (((a as u16) * (b as u16)) / g) as u8
-}
-
-fn derive_hash58_hmac_key(guid: &[u8; 8]) -> [u8; 64] {
-    let mut y = [0u8; 16];
-    for i in 0..8 {
-        let a = guid[i];
-        let b = HASH58_FIXED_SALT[i * 2];
-        let c = HASH58_FIXED_SALT[i * 2 + 1];
-        y[i * 2] = gcd_u8(a, b);
-        y[i * 2 + 1] = lcm_u8(a, c);
-    }
-    let mut seed = Vec::with_capacity(24);
-    seed.extend_from_slice(&y);
-    seed.extend_from_slice(guid);
-    let digest = sha1_digest(&seed);
-
-    let mut key_block = [0u8; 64];
-    for (i, slot) in key_block.iter_mut().enumerate() {
-        *slot = digest[i % 20].wrapping_add(y[i % 16]);
-    }
-    key_block
-}
-
-fn compute_hashes(db_bytes: &[u8], guid: &FireWireGuid) -> ([u8; 20], [u8; 46]) {
-    let mut normalized = db_bytes.to_vec();
-    // Zero fields excluded by iPod firmware when computing database hashes
-    normalized[0x18..0x20].fill(0);
-    normalized[0x32..0x36].fill(0);
-    normalized[0x58..0x58 + 20].fill(0);
-    normalized[0x72..0x72 + 46].fill(0);
-
-    // 1. Compute hash58 via GCD/LCM key schedule + HMAC-SHA1
-    let key_block = derive_hash58_hmac_key(&guid.0);
-    let mut k_ipad = [0x36u8; 64];
-    let mut k_opad = [0x5Cu8; 64];
-    for i in 0..64 {
-        k_ipad[i] ^= key_block[i];
-        k_opad[i] ^= key_block[i];
-    }
-
-    let mut inner_input = Vec::with_capacity(64 + normalized.len());
-    inner_input.extend_from_slice(&k_ipad);
-    inner_input.extend_from_slice(&normalized);
-    let inner_hash = sha1_digest(&inner_input);
-
-    let mut outer_input = Vec::with_capacity(84);
-    outer_input.extend_from_slice(&k_opad);
-    outer_input.extend_from_slice(&inner_hash);
-    let hash58 = sha1_digest(&outer_input);
-
-    // 2. Compute hash72 (0x01 0x00 header + 12-byte random/GUID nonce + 32-byte AES-128-CBC encrypted SHA-1 block)
-    let body_sha1 = sha1_digest(&normalized);
-    let mut nonce = [0u8; 12];
-    nonce[0..8].copy_from_slice(&guid.0);
-    nonce[8..12].copy_from_slice(&body_sha1[0..4]);
-
-    let mut iv = [0u8; 16];
-    iv[0..12].copy_from_slice(&nonce);
-    iv[12..16].copy_from_slice(&guid.0[0..4]);
-
-    let mut plaintext = [0u8; 32];
-    plaintext[0..20].copy_from_slice(&body_sha1);
-    plaintext[20..32].copy_from_slice(&nonce);
-
-    let ciphertext = aes128_cbc_encrypt(&plaintext, &HASH72_AES_KEY, &iv);
-
-    let mut hash72 = [0u8; 46];
-    hash72[0] = 0x01;
-    hash72[1] = 0x00;
-    hash72[2..14].copy_from_slice(&nonce);
-    hash72[14..46].copy_from_slice(&ciphertext);
-
-    (hash58, hash72)
-}
-
-const AES_SBOX: [u8; 256] = [
+// Exact tables and constants from libgpod's itdb_hash58.c and itdb_hash72.c
+const TABLE1: [u8; 256] = [
     0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
     0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
     0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
@@ -176,6 +157,148 @@ const AES_SBOX: [u8; 256] = [
     0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
 ];
 
+const TABLE2: [u8; 256] = [
+    0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
+    0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87, 0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb,
+    0x54, 0x7b, 0x94, 0x32, 0xa6, 0xc2, 0x23, 0x3d, 0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e,
+    0x08, 0x2e, 0xa1, 0x66, 0x28, 0xd9, 0x24, 0xb2, 0x76, 0x5b, 0xa2, 0x49, 0x6d, 0x8b, 0xd1, 0x25,
+    0x72, 0xf8, 0xf6, 0x64, 0x86, 0x68, 0x98, 0x16, 0xd4, 0xa4, 0x5c, 0xcc, 0x5d, 0x65, 0xb6, 0x92,
+    0x6c, 0x70, 0x48, 0x50, 0xfd, 0xed, 0xb9, 0xda, 0x5e, 0x15, 0x46, 0x57, 0xa7, 0x8d, 0x9d, 0x84,
+    0x90, 0xd8, 0xab, 0x00, 0x8c, 0xbc, 0xd3, 0x0a, 0xf7, 0xe4, 0x58, 0x05, 0xb8, 0xb3, 0x45, 0x06,
+    0xd0, 0x2c, 0x1e, 0x8f, 0xca, 0x3f, 0x0f, 0x02, 0xc1, 0xaf, 0xbd, 0x03, 0x01, 0x13, 0x8a, 0x6b,
+    0x3a, 0x91, 0x11, 0x41, 0x4f, 0x67, 0xdc, 0xea, 0x97, 0xf2, 0xcf, 0xce, 0xf0, 0xb4, 0xe6, 0x73,
+    0x96, 0xac, 0x74, 0x22, 0xe7, 0xad, 0x35, 0x85, 0xe2, 0xf9, 0x37, 0xe8, 0x1c, 0x75, 0xdf, 0x6e,
+    0x47, 0xf1, 0x1a, 0x71, 0x1d, 0x29, 0xc5, 0x89, 0x6f, 0xb7, 0x62, 0x0e, 0xaa, 0x18, 0xbe, 0x1b,
+    0xfc, 0x56, 0x3e, 0x4b, 0xc6, 0xd2, 0x79, 0x20, 0x9a, 0xdb, 0xc0, 0xfe, 0x78, 0xcd, 0x5a, 0xf4,
+    0x1f, 0xdd, 0xa8, 0x33, 0x88, 0x07, 0xc7, 0x31, 0xb1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xec, 0x5f,
+    0x60, 0x51, 0x7f, 0xa9, 0x19, 0xb5, 0x4a, 0x0d, 0x2d, 0xe5, 0x7a, 0x9f, 0x93, 0xc9, 0x9c, 0xef,
+    0xa0, 0xe0, 0x3b, 0x4d, 0xae, 0x2a, 0xf5, 0xb0, 0xc8, 0xeb, 0xbb, 0x3c, 0x83, 0x53, 0x99, 0x61,
+    0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d,
+];
+
+const HASH58_FIXED: [u8; 18] = [
+    0x67, 0x23, 0xFE, 0x30, 0x45, 0x33, 0xF8, 0x90, 0x99, 0x21, 0x07, 0xC1, 0xD0, 0x12, 0xB2, 0xA1,
+    0x07, 0x81,
+];
+
+const HASH72_AES_KEY: [u8; 16] = [
+    0x61, 0x8C, 0xA1, 0x0D, 0xC7, 0xF5, 0x7F, 0xD3, 0xB4, 0x72, 0x3E, 0x08, 0x15, 0x74, 0x63, 0xD7,
+];
+
+fn gcd_i32(mut a: i32, mut b: i32) -> i32 {
+    loop {
+        a %= b;
+        if a == 0 {
+            return b;
+        }
+        b %= a;
+        if b == 0 {
+            return a;
+        }
+    }
+}
+
+fn lcm_i32(a: i32, b: i32) -> i32 {
+    if a == 0 || b == 0 {
+        return 1;
+    }
+    (a * b) / gcd_i32(a, b)
+}
+
+/// Exact port of `generate_key` from `libgpod/src/itdb_hash58.c`.
+pub fn generate_hash58_key(firewire_id: &[u8; 8]) -> [u8; 64] {
+    let mut y = [0u8; 16];
+    for i in 0..4 {
+        let a = firewire_id[i * 2] as i32;
+        let b = firewire_id[i * 2 + 1] as i32;
+        let cur_lcm = lcm_i32(a, b);
+        let hi = ((cur_lcm & 0xFF00) >> 8) as usize;
+        let lo = (cur_lcm & 0xFF) as usize;
+
+        y[i * 4] = TABLE1[hi];
+        y[i * 4 + 1] = TABLE2[hi];
+        y[i * 4 + 2] = TABLE1[lo];
+        y[i * 4 + 3] = TABLE2[lo];
+    }
+
+    let mut seed = Vec::with_capacity(34);
+    seed.extend_from_slice(&HASH58_FIXED);
+    seed.extend_from_slice(&y);
+    let digest = sha1_digest(&seed);
+
+    let mut key = [0u8; 64];
+    key[0..20].copy_from_slice(&digest);
+    key
+}
+
+/// Exact port of `itdb_hash58_write_hash` + `itdb_compute_hash` from `libgpod/src/itdb_hash58.c`.
+pub fn compute_hash58(db_bytes: &[u8], guid: &FireWireGuid) -> [u8; 20] {
+    let mut normalized = db_bytes.to_vec();
+    normalized[0x18..0x20].fill(0); // db_id (8 bytes)
+    normalized[0x32..0x46].fill(0); // unk_0x32 (20 bytes)
+    normalized[0x58..0x6C].fill(0); // hash58 (20 bytes)
+
+    let key = generate_hash58_key(&guid.0);
+    let mut k_ipad = [0u8; 64];
+    let mut k_opad = [0u8; 64];
+    for i in 0..64 {
+        k_ipad[i] = key[i] ^ 0x36;
+        k_opad[i] = key[i] ^ 0x5C;
+    }
+
+    let mut inner_input = Vec::with_capacity(64 + normalized.len());
+    inner_input.extend_from_slice(&k_ipad);
+    inner_input.extend_from_slice(&normalized);
+    let inner_hash = sha1_digest(&inner_input);
+
+    let mut outer_input = Vec::with_capacity(84);
+    outer_input.extend_from_slice(&k_opad);
+    outer_input.extend_from_slice(&inner_hash);
+    sha1_digest(&outer_input)
+}
+
+/// Exact port of `itdb_hash72_compute_itunesdb_sha1` from `libgpod/src/itdb_hash72.c`.
+pub fn compute_itunesdb_sha1_for_hash72(db_bytes: &[u8]) -> [u8; 20] {
+    let mut normalized = db_bytes.to_vec();
+    normalized[0x18..0x20].fill(0); // db_id (8 bytes)
+    normalized[0x32..0x46].fill(0); // unk_0x32 (20 bytes)
+    normalized[0x58..0x6C].fill(0); // hash58 (20 bytes)
+    normalized[0x72..0xA0].fill(0); // hash72 (46 bytes)
+    sha1_digest(&normalized)
+}
+
+/// Exact port of `hash_generate` from `libgpod/src/itdb_hash72.c`.
+pub fn generate_hash72(sha1: &[u8; 20], iv: &[u8; 16], random_bytes: &[u8; 12]) -> [u8; 46] {
+    let mut plaintext = [0u8; 32];
+    plaintext[0..20].copy_from_slice(sha1);
+    plaintext[20..32].copy_from_slice(random_bytes);
+
+    let ciphertext = aes128_cbc_encrypt(&plaintext, &HASH72_AES_KEY, iv);
+
+    let mut signature = [0u8; 46];
+    signature[0] = 0x01;
+    signature[1] = 0x00;
+    signature[2..14].copy_from_slice(random_bytes);
+    signature[14..46].copy_from_slice(&ciphertext);
+    signature
+}
+
+fn gmul(mut a: u8, mut b: u8) -> u8 {
+    let mut p = 0u8;
+    for _ in 0..8 {
+        if (b & 1) != 0 {
+            p ^= a;
+        }
+        let hi = a & 0x80;
+        a <<= 1;
+        if hi != 0 {
+            a ^= 0x1B;
+        }
+        b >>= 1;
+    }
+    p
+}
+
 fn gmul2(x: u8) -> u8 {
     if (x & 0x80) != 0 {
         (x << 1) ^ 0x1B
@@ -193,10 +316,10 @@ fn aes128_expand_key(key: &[u8; 16]) -> [[u8; 16]; 11] {
         let prev = round_keys[r - 1];
         let mut cur = [0u8; 16];
         let t = [
-            AES_SBOX[prev[13] as usize] ^ RCON[r - 1],
-            AES_SBOX[prev[14] as usize],
-            AES_SBOX[prev[15] as usize],
-            AES_SBOX[prev[12] as usize],
+            TABLE1[prev[13] as usize] ^ RCON[r - 1],
+            TABLE1[prev[14] as usize],
+            TABLE1[prev[15] as usize],
+            TABLE1[prev[12] as usize],
         ];
         for i in 0..4 {
             cur[i] = prev[i] ^ t[i];
@@ -220,9 +343,8 @@ fn aes128_encrypt_block(block: &[u8; 16], round_keys: &[[u8; 16]; 11]) -> [u8; 1
 
     for r in 1..=10 {
         for b in state.iter_mut() {
-            *b = AES_SBOX[*b as usize];
+            *b = TABLE1[*b as usize];
         }
-        // ShiftRows
         let s = state;
         state[1] = s[5];
         state[5] = s[9];
@@ -240,7 +362,6 @@ fn aes128_encrypt_block(block: &[u8; 16], round_keys: &[[u8; 16]; 11]) -> [u8; 1
         state[15] = s[11];
 
         if r < 10 {
-            // MixColumns
             for col in 0..4 {
                 let c = col * 4;
                 let a0 = state[c];
@@ -257,6 +378,54 @@ fn aes128_encrypt_block(block: &[u8; 16], round_keys: &[[u8; 16]; 11]) -> [u8; 1
 
         for i in 0..16 {
             state[i] ^= round_keys[r][i];
+        }
+    }
+    state
+}
+
+fn aes128_decrypt_block(block: &[u8; 16], round_keys: &[[u8; 16]; 11]) -> [u8; 16] {
+    let mut state = *block;
+    for i in 0..16 {
+        state[i] ^= round_keys[10][i];
+    }
+
+    for r in (0..10).rev() {
+        let s = state;
+        state[1] = s[13];
+        state[5] = s[1];
+        state[9] = s[5];
+        state[13] = s[9];
+
+        state[2] = s[10];
+        state[6] = s[14];
+        state[10] = s[2];
+        state[14] = s[6];
+
+        state[3] = s[7];
+        state[7] = s[11];
+        state[11] = s[15];
+        state[15] = s[3];
+
+        for b in state.iter_mut() {
+            *b = TABLE2[*b as usize];
+        }
+
+        for i in 0..16 {
+            state[i] ^= round_keys[r][i];
+        }
+
+        if r > 0 {
+            for col in 0..4 {
+                let c = col * 4;
+                let a0 = state[c];
+                let a1 = state[c + 1];
+                let a2 = state[c + 2];
+                let a3 = state[c + 3];
+                state[c] = gmul(a0, 0x0E) ^ gmul(a1, 0x0B) ^ gmul(a2, 0x0D) ^ gmul(a3, 0x09);
+                state[c + 1] = gmul(a0, 0x09) ^ gmul(a1, 0x0E) ^ gmul(a2, 0x0B) ^ gmul(a3, 0x0D);
+                state[c + 2] = gmul(a0, 0x0D) ^ gmul(a1, 0x09) ^ gmul(a2, 0x0E) ^ gmul(a3, 0x0B);
+                state[c + 3] = gmul(a0, 0x0B) ^ gmul(a1, 0x0D) ^ gmul(a2, 0x09) ^ gmul(a3, 0x0E);
+            }
         }
     }
     state

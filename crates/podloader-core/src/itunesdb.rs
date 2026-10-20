@@ -195,7 +195,7 @@ impl ItunesDb {
 
             let body = match dataset_type {
                 1 => parse_track_list_body(body_slice)?,
-                2 => parse_playlist_list_body(body_slice)?,
+                2 | 3 => parse_playlist_list_body(body_slice)?,
                 _ => MhsdBody::Raw(body_slice.to_vec()),
             };
 
@@ -234,6 +234,7 @@ impl ItunesDb {
     pub fn to_device_library(&self) -> DeviceLibrary {
         let mut tracks = Vec::new();
         let mut playlists = Vec::new();
+        let has_type_2 = self.datasets.iter().any(|d| d.dataset_type == 2);
 
         for ds in &self.datasets {
             match &ds.body {
@@ -243,8 +244,10 @@ impl ItunesDb {
                     }
                 }
                 MhsdBody::PlaylistList { playlists: p, .. } => {
-                    for chunk in p {
-                        playlists.push(chunk.playlist.clone());
+                    if ds.dataset_type == 2 || !has_type_2 {
+                        for chunk in p {
+                            playlists.push(chunk.playlist.clone());
+                        }
                     }
                 }
                 MhsdBody::Raw(_) => {}
@@ -340,18 +343,18 @@ impl ItunesDb {
 
                         write_mhit_track_metadata(&mut chunk.header_bytes, host_file);
 
-                        // Preserve unknown mhods (types outside 1..=5) while updating string mhods 1..=5
+                        // Preserve unknown mhods (types outside 1..=6, 22) while updating string mhods
                         let preserved: Vec<MhodChunk> = chunk
                             .mhods
                             .iter()
-                            .filter(|m| !(1..=5).contains(&m.mhod_type))
+                            .filter(|m| !matches!(m.mhod_type, 1..=6 | 22))
                             .cloned()
                             .collect();
                         let mut new_mhods = build_track_string_mhods(host_file, obfuscated_path);
                         new_mhods.extend(preserved);
                         chunk.mhods = new_mhods;
 
-                        self.append_track_to_playlists(existing_id, target_playlist_id);
+                        self.append_track_to_playlists(existing_id, None, target_playlist_id);
                         return (existing_id, Some(old_path));
                     }
                 }
@@ -359,18 +362,30 @@ impl ItunesDb {
         }
 
         let new_id = self.next_track_id();
-        let new_chunk = build_new_mhit_chunk(new_id, host_file, obfuscated_path);
+        let template_header = self.datasets.iter().find_map(|ds| match &ds.body {
+            MhsdBody::TrackList { tracks, .. } => tracks.first().map(|t| t.header_bytes.clone()),
+            _ => None,
+        });
+        let new_chunk =
+            build_new_mhit_chunk(new_id, host_file, obfuscated_path, template_header.as_deref());
+        let mut new_track_idx = 0usize;
         for ds in &mut self.datasets {
             if let MhsdBody::TrackList { tracks, .. } = &mut ds.body {
+                new_track_idx = tracks.len();
                 tracks.push(new_chunk);
                 break;
             }
         }
-        self.append_track_to_playlists(new_id, target_playlist_id);
+        self.append_track_to_playlists(new_id, Some(new_track_idx), target_playlist_id);
         (new_id, None)
     }
 
-    fn append_track_to_playlists(&mut self, track_id: u32, target_playlist_id: Option<u64>) {
+    fn append_track_to_playlists(
+        &mut self,
+        track_id: u32,
+        new_track_mhlt_index: Option<usize>,
+        target_playlist_id: Option<u64>,
+    ) {
         for ds in &mut self.datasets {
             if let MhsdBody::PlaylistList { playlists, .. } = &mut ds.body {
                 for pl in playlists {
@@ -380,6 +395,12 @@ impl ItunesDb {
                         let next_pos = (pl.mhips.len() as u32) + 1;
                         pl.mhips.push(build_new_mhip_chunk(track_id, next_pos));
                         pl.playlist.track_ids.push(track_id);
+
+                        if pl.playlist.kind == PlaylistKind::Master {
+                            if let Some(track_idx) = new_track_mhlt_index {
+                                update_master_playlist_index_mhods(&mut pl.mhods, track_idx as u32);
+                            }
+                        }
                     }
                 }
             }
@@ -387,7 +408,42 @@ impl ItunesDb {
     }
 }
 
+fn update_master_playlist_index_mhods(mhods: &mut [MhodChunk], new_track_idx: u32) {
+    for mhod in mhods.iter_mut() {
+        if mhod.mhod_type == 52 && mhod.raw_bytes.len() >= 72 {
+            let old_count = u32::from_le_bytes([
+                mhod.raw_bytes[28],
+                mhod.raw_bytes[29],
+                mhod.raw_bytes[30],
+                mhod.raw_bytes[31],
+            ]);
+            let new_count = old_count.saturating_add(1);
+            mhod.raw_bytes.extend_from_slice(&new_track_idx.to_le_bytes());
+            let new_total_len = mhod.raw_bytes.len() as u32;
+            mhod.raw_bytes[8..12].copy_from_slice(&new_total_len.to_le_bytes());
+            mhod.raw_bytes[28..32].copy_from_slice(&new_count.to_le_bytes());
+        } else if mhod.mhod_type == 53 && mhod.raw_bytes.len() >= 52 {
+            // Increment num_entries of the last jump-table entry (at raw_bytes.len() - 4)
+            let len = mhod.raw_bytes.len();
+            let last_count = u32::from_le_bytes([
+                mhod.raw_bytes[len - 4],
+                mhod.raw_bytes[len - 3],
+                mhod.raw_bytes[len - 2],
+                mhod.raw_bytes[len - 1],
+            ]);
+            mhod.raw_bytes[len - 4..len]
+                .copy_from_slice(&last_count.saturating_add(1).to_le_bytes());
+        }
+    }
+}
+
 fn build_track_string_mhods(host_file: &HostFile, obfuscated_path: &str) -> Vec<MhodChunk> {
+    let filetype_desc = match host_file.format.to_ascii_uppercase().as_str() {
+        "ALAC" => "Apple Lossless audio file",
+        "AAC" | "M4A" => "AAC audio file",
+        "WAV" => "WAV audio file",
+        _ => "MPEG audio file",
+    };
     vec![
         MhodChunk {
             mhod_type: 1,
@@ -398,12 +454,20 @@ fn build_track_string_mhods(host_file: &HostFile, obfuscated_path: &str) -> Vec<
             raw_bytes: encode_string_mhod(4, &host_file.artist),
         },
         MhodChunk {
+            mhod_type: 22,
+            raw_bytes: encode_string_mhod(22, &host_file.artist),
+        },
+        MhodChunk {
             mhod_type: 3,
             raw_bytes: encode_string_mhod(3, &host_file.album),
         },
         MhodChunk {
             mhod_type: 5,
             raw_bytes: encode_string_mhod(5, &host_file.genre),
+        },
+        MhodChunk {
+            mhod_type: 6,
+            raw_bytes: encode_string_mhod(6, filetype_desc),
         },
         MhodChunk {
             mhod_type: 2,
@@ -414,28 +478,79 @@ fn build_track_string_mhods(host_file: &HostFile, obfuscated_path: &str) -> Vec<
 
 fn write_mhit_track_metadata(header_bytes: &mut [u8], host_file: &HostFile) {
     if header_bytes.len() >= 96 {
+        let fmt = host_file.format.to_ascii_uppercase();
+        let (filetype_magic, type1, type2): (&[u8; 4], u8, u8) = match fmt.as_str() {
+            "ALAC" | "AAC" | "M4A" => (b" A4M", 0, 0),
+            "WAV" => (b" VAW", 0, 0),
+            _ => (b" 3PM", 0, 1),
+        };
+        header_bytes[24..28].copy_from_slice(filetype_magic);
+        header_bytes[28] = type1;
+        header_bytes[29] = type2;
         header_bytes[36..40].copy_from_slice(&(host_file.file_size as u32).to_le_bytes());
         header_bytes[40..44].copy_from_slice(&host_file.duration_ms.to_le_bytes());
         header_bytes[44..48].copy_from_slice(&host_file.track_number.to_le_bytes());
         header_bytes[52..56].copy_from_slice(&host_file.year.to_le_bytes());
         header_bytes[56..60].copy_from_slice(&host_file.bitrate_kbps.to_le_bytes());
+        // Default 44.1 kHz fixed-point sample rate (44100 << 16 = 0xAC440000) if unset
+        if header_bytes[60..64] == [0, 0, 0, 0] {
+            header_bytes[60..64].copy_from_slice(&0xAC440000u32.to_le_bytes());
+        }
         header_bytes[92..96].copy_from_slice(&host_file.disc_number.to_le_bytes());
+    }
+    if header_bytes.len() >= 128 {
+        header_bytes[124..128].copy_from_slice(&0xFFFF0001u32.to_le_bytes());
+    }
+    if header_bytes.len() >= 212 {
+        // media_type = 0x00000001 (Audio)
+        header_bytes[208..212].copy_from_slice(&1u32.to_le_bytes());
+    }
+    if header_bytes.len() >= 304 {
+        header_bytes[300..304].copy_from_slice(&(host_file.file_size as u32).to_le_bytes());
     }
 }
 
-fn build_new_mhit_chunk(track_id: u32, host_file: &HostFile, obfuscated_path: &str) -> MhitChunk {
+fn build_new_mhit_chunk(
+    track_id: u32,
+    host_file: &HostFile,
+    obfuscated_path: &str,
+    template_header: Option<&[u8]>,
+) -> MhitChunk {
     let mhods = build_track_string_mhods(host_file, obfuscated_path);
-    let header_len = 244u32;
+    let header_len = template_header.map(|t| t.len() as u32).unwrap_or(244u32);
     let body_len: usize = mhods.iter().map(|m| m.raw_bytes.len()).sum();
     let total_len = header_len + body_len as u32;
 
-    let mut header_bytes = vec![0u8; header_len as usize];
+    let mut header_bytes = match template_header {
+        Some(tpl) => {
+            let mut h = tpl.to_vec();
+            // Clear track-specific playcount/rating/bookmark/gapless fields while keeping library/album IDs
+            h[30] = 0; // rating
+            if h.len() >= 92 {
+                h[80..92].fill(0); // play_count, play_count2, last_played
+            }
+            if h.len() >= 156 {
+                h[148..156].fill(0); // bookmark_ms
+            }
+            h
+        }
+        None => vec![0u8; header_len as usize],
+    };
+
     header_bytes[0..4].copy_from_slice(b"mhit");
     header_bytes[4..8].copy_from_slice(&header_len.to_le_bytes());
     header_bytes[8..12].copy_from_slice(&total_len.to_le_bytes());
     header_bytes[12..16].copy_from_slice(&(mhods.len() as u32).to_le_bytes());
     header_bytes[16..20].copy_from_slice(&track_id.to_le_bytes());
     header_bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+
+    let dbid: u64 = 0x504F_444C_0000_0000u64 | (track_id as u64);
+    if header_bytes.len() >= 120 {
+        header_bytes[112..120].copy_from_slice(&dbid.to_le_bytes());
+    }
+    if header_bytes.len() >= 176 {
+        header_bytes[168..176].copy_from_slice(&dbid.to_le_bytes());
+    }
     write_mhit_track_metadata(&mut header_bytes, host_file);
 
     MhitChunk {
@@ -462,10 +577,10 @@ fn build_new_mhit_chunk(track_id: u32, host_file: &HostFile, obfuscated_path: &s
 }
 
 fn build_new_mhip_chunk(track_id: u32, order_position: u32) -> MhipChunk {
-    let mut order_raw = vec![0u8; 28];
+    let mut order_raw = vec![0u8; 44];
     order_raw[0..4].copy_from_slice(b"mhod");
     order_raw[4..8].copy_from_slice(&24u32.to_le_bytes());
-    order_raw[8..12].copy_from_slice(&28u32.to_le_bytes());
+    order_raw[8..12].copy_from_slice(&44u32.to_le_bytes());
     order_raw[12..16].copy_from_slice(&100u32.to_le_bytes());
     order_raw[24..28].copy_from_slice(&order_position.to_le_bytes());
 
@@ -480,6 +595,7 @@ fn build_new_mhip_chunk(track_id: u32, order_position: u32) -> MhipChunk {
     header_bytes[4..8].copy_from_slice(&header_len.to_le_bytes());
     header_bytes[8..12].copy_from_slice(&total_len.to_le_bytes());
     header_bytes[12..16].copy_from_slice(&1u32.to_le_bytes());
+    header_bytes[20..24].copy_from_slice(&track_id.saturating_add(1).to_le_bytes());
     header_bytes[24..28].copy_from_slice(&track_id.to_le_bytes());
 
     MhipChunk {

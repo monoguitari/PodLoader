@@ -17,7 +17,10 @@ use crate::host::{collect_host_files_from_paths, is_native_ipod_format};
 use crate::itunesdb::{build_empty_itunesdb, ItunesDb};
 use crate::playcounts::{merge_play_counts_into_tracks, parse_play_counts};
 pub use crate::signing::verify_itunesdb_signatures;
-use crate::signing::{parse_firewire_guid_bytes, sign_itunesdb};
+use crate::signing::{
+    extract_hash72_params, parse_firewire_guid_bytes, resign_itunesdb_hash72_with_params,
+    sign_itunesdb,
+};
 use crate::sysinfo::{cache_guid_in_sysinfo, normalize_firewire_guid, parse_sysinfo};
 
 #[derive(Debug, Error)]
@@ -167,24 +170,58 @@ fn query_volume_space(mount_path: &Path) -> (u64, u64) {
 impl SystemHardwareDeviceAdapter {
     fn scan_apple_usb_serial_guid(&self) -> Option<String> {
         let usb_root = Path::new("/sys/bus/usb/devices");
-        let entries = fs::read_dir(usb_root).ok()?;
-        for entry in entries.flatten() {
-            let dir = entry.path();
-            let Ok(vendor) = fs::read_to_string(dir.join("idVendor")) else {
-                continue;
-            };
-            if vendor.trim().eq_ignore_ascii_case("05ac") {
-                if let Ok(serial) = fs::read_to_string(dir.join("serial")) {
-                    let trimmed = serial.trim();
-                    if trimmed.len() >= 16 {
-                        let candidate = &trimmed[trimmed.len() - 16..];
-                        if candidate.chars().all(|c| c.is_ascii_hexdigit()) {
-                            return Some(candidate.to_uppercase());
+        if let Ok(entries) = fs::read_dir(usb_root) {
+            for entry in entries.flatten() {
+                let dir = entry.path();
+                let Ok(vendor) = fs::read_to_string(dir.join("idVendor")) else {
+                    continue;
+                };
+                if vendor.trim().eq_ignore_ascii_case("05ac") {
+                    if let Ok(serial) = fs::read_to_string(dir.join("serial")) {
+                        let trimmed = serial.trim();
+                        if trimmed.len() >= 16 {
+                            let candidate = &trimmed[..16];
+                            if candidate.chars().all(|c| c.is_ascii_hexdigit()) {
+                                return Some(candidate.to_uppercase());
+                            }
                         }
                     }
                 }
             }
         }
+
+        // On WSL2 (when WSL_INTEROP socket is active), query Windows USB Enum registry for Apple iPod FireWire GUID (000A27...)
+        if let Ok(interop) = std::env::var("WSL_INTEROP") {
+            if Path::new(&interop).exists() && Path::new("/mnt/c/Windows/System32/reg.exe").is_file()
+            {
+                if let Ok(out) = std::process::Command::new("/mnt/c/Windows/System32/reg.exe")
+                    .args([
+                        "query",
+                        r"HKLM\SYSTEM\CurrentControlSet\Enum\USB",
+                        "/s",
+                        "/f",
+                        "000A27",
+                        "/k",
+                    ])
+                    .output()
+                {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    for line in text.lines() {
+                        if let Some(last_seg) = line.trim().rsplit('\\').next() {
+                            if last_seg.len() >= 16 {
+                                let candidate = &last_seg[..16];
+                                if candidate.to_uppercase().starts_with("000A27")
+                                    && candidate.chars().all(|c| c.is_ascii_hexdigit())
+                                {
+                                    return Some(candidate.to_uppercase());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         None
     }
 }
@@ -818,15 +855,27 @@ fn finalize_itunesdb_commit(
     let play_counts_path = itunes_dir.join("Play Counts");
     let bak_path = itunes_dir.join("iTunesDB.bak");
 
+    let extracted_72 = extract_hash72_params(original_db_bytes).or_else(|| {
+        fs::read(&bak_path)
+            .ok()
+            .and_then(|bak| extract_hash72_params(&bak))
+    });
+
     fs::write(&bak_path, original_db_bytes)?;
 
     if let Some(guid) = firewire_guid {
         parsed_db.ensure_mhbd_header_min_len(244);
         let mut new_db_bytes = parsed_db.to_bytes();
+        if let Some((iv, rand12)) = extracted_72 {
+            resign_itunesdb_hash72_with_params(&mut new_db_bytes, &iv, &rand12);
+        }
         sign_itunesdb(&mut new_db_bytes, guid)?;
         atomic_write_file(&itunesdb_path, &new_db_bytes)?;
     } else {
-        let new_db_bytes = parsed_db.to_bytes();
+        let mut new_db_bytes = parsed_db.to_bytes();
+        if let Some((iv, rand12)) = extracted_72 {
+            resign_itunesdb_hash72_with_params(&mut new_db_bytes, &iv, &rand12);
+        }
         atomic_write_file(&itunesdb_path, &new_db_bytes)?;
     }
 

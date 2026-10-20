@@ -1327,6 +1327,175 @@ fn recovers_from_mid_batch_interruption_with_rollback_or_commit_completed_tracks
     );
 }
 
+#[test]
+fn updates_master_playlist_index_mhods_mhsd_type3_and_re_signs_extracted_hash72() {
+    use podloader_core::signing::{
+        compute_itunesdb_sha1_for_hash72, extract_hash72_params, generate_hash72,
+    };
+
+    let device_temp = TempDir::new().expect("create device temp");
+    let mount_path = device_temp.path().to_path_buf();
+    fs::create_dir_all(mount_path.join("iPod_Control").join("iTunes")).expect("create iTunes dir");
+    fs::create_dir_all(mount_path.join("iPod_Control").join("Device")).expect("create Device dir");
+    for idx in 0..50 {
+        fs::create_dir_all(
+            mount_path
+                .join("iPod_Control")
+                .join("Music")
+                .join(format!("F{:02}", idx)),
+        )
+        .expect("create Fxx");
+    }
+
+    // Build a database with a 624-byte mhit, mhsd type 3 + mhsd type 2 Master Playlists containing mhod 52 & 53,
+    // and a valid hash72 signature (without setting FireWireGuid in SysInfo).
+    let mut mhit = build_mhit_fixture(
+        101,
+        "Existing Track",
+        "Existing Artist",
+        "Existing Album",
+        "Rock",
+        ":iPod_Control:Music:F00:EXST.mp3",
+        1,
+        1,
+        2024,
+        200_000,
+        320,
+        0,
+        0,
+        vec![],
+    );
+    // Expand mhit header from 244 to 624 bytes
+    let old_hdr_len = u32::from_le_bytes([mhit[4], mhit[5], mhit[6], mhit[7]]) as usize;
+    let body_bytes = mhit[old_hdr_len..].to_vec();
+    let mut hdr624 = vec![0u8; 624];
+    hdr624[..old_hdr_len].copy_from_slice(&mhit[..old_hdr_len]);
+    let new_total = (624 + body_bytes.len()) as u32;
+    hdr624[4..8].copy_from_slice(&624u32.to_le_bytes());
+    hdr624[8..12].copy_from_slice(&new_total.to_le_bytes());
+    hdr624[208..212].copy_from_slice(&1u32.to_le_bytes()); // media_type = Audio
+    hdr624.extend_from_slice(&body_bytes);
+    mhit = hdr624;
+
+    let mut mhod52 = vec![0u8; 76];
+    mhod52[0..4].copy_from_slice(b"mhod");
+    mhod52[4..8].copy_from_slice(&24u32.to_le_bytes());
+    mhod52[8..12].copy_from_slice(&76u32.to_le_bytes());
+    mhod52[12..16].copy_from_slice(&52u32.to_le_bytes());
+    mhod52[24..28].copy_from_slice(&3u32.to_le_bytes());
+    mhod52[28..32].copy_from_slice(&1u32.to_le_bytes()); // count = 1
+    mhod52[72..76].copy_from_slice(&0u32.to_le_bytes()); // index 0
+
+    let mut mhod53 = vec![0u8; 52];
+    mhod53[0..4].copy_from_slice(b"mhod");
+    mhod53[4..8].copy_from_slice(&24u32.to_le_bytes());
+    mhod53[8..12].copy_from_slice(&52u32.to_le_bytes());
+    mhod53[12..16].copy_from_slice(&53u32.to_le_bytes());
+    mhod53[24..28].copy_from_slice(&3u32.to_le_bytes());
+    mhod53[28..32].copy_from_slice(&1u32.to_le_bytes()); // 1 entry
+    mhod53[48..52].copy_from_slice(&1u32.to_le_bytes()); // num_entries = 1
+
+    let master_mhyp = build_mhyp_fixture(1000, "My iPod", true, vec![mhod52, mhod53], &[101]);
+
+    let mut mhlt = vec![0u8; 92];
+    mhlt[0..4].copy_from_slice(b"mhlt");
+    mhlt[4..8].copy_from_slice(&92u32.to_le_bytes());
+    mhlt[8..12].copy_from_slice(&1u32.to_le_bytes());
+    mhlt.extend_from_slice(&mhit);
+
+    let mut mhsd_tracks = vec![0u8; 96];
+    mhsd_tracks[0..4].copy_from_slice(b"mhsd");
+    mhsd_tracks[4..8].copy_from_slice(&96u32.to_le_bytes());
+    mhsd_tracks[8..12].copy_from_slice(&((96 + mhlt.len()) as u32).to_le_bytes());
+    mhsd_tracks[12..16].copy_from_slice(&1u32.to_le_bytes());
+    mhsd_tracks.extend_from_slice(&mhlt);
+
+    let mut mhlp = vec![0u8; 92];
+    mhlp[0..4].copy_from_slice(b"mhlp");
+    mhlp[4..8].copy_from_slice(&92u32.to_le_bytes());
+    mhlp[8..12].copy_from_slice(&1u32.to_le_bytes());
+    mhlp.extend_from_slice(&master_mhyp);
+
+    let mut mhsd_playlists_type3 = vec![0u8; 96];
+    mhsd_playlists_type3[0..4].copy_from_slice(b"mhsd");
+    mhsd_playlists_type3[4..8].copy_from_slice(&96u32.to_le_bytes());
+    mhsd_playlists_type3[8..12].copy_from_slice(&((96 + mhlp.len()) as u32).to_le_bytes());
+    mhsd_playlists_type3[12..16].copy_from_slice(&3u32.to_le_bytes());
+    mhsd_playlists_type3.extend_from_slice(&mhlp);
+
+    let mut mhsd_playlists_type2 = vec![0u8; 96];
+    mhsd_playlists_type2[0..4].copy_from_slice(b"mhsd");
+    mhsd_playlists_type2[4..8].copy_from_slice(&96u32.to_le_bytes());
+    mhsd_playlists_type2[8..12].copy_from_slice(&((96 + mhlp.len()) as u32).to_le_bytes());
+    mhsd_playlists_type2[12..16].copy_from_slice(&2u32.to_le_bytes());
+    mhsd_playlists_type2.extend_from_slice(&mhlp);
+
+    let mhbd_header_len = 244u32;
+    let total_len = mhbd_header_len
+        + (mhsd_tracks.len() + mhsd_playlists_type3.len() + mhsd_playlists_type2.len()) as u32;
+    let mut db_bytes = vec![0u8; mhbd_header_len as usize];
+    db_bytes[0..4].copy_from_slice(b"mhbd");
+    db_bytes[4..8].copy_from_slice(&mhbd_header_len.to_le_bytes());
+    db_bytes[8..12].copy_from_slice(&total_len.to_le_bytes());
+    db_bytes[12..16].copy_from_slice(&1u32.to_le_bytes());
+    db_bytes[16..20].copy_from_slice(&0x73u32.to_le_bytes());
+    db_bytes[20..24].copy_from_slice(&3u32.to_le_bytes());
+    db_bytes.extend_from_slice(&mhsd_tracks);
+    db_bytes.extend_from_slice(&mhsd_playlists_type3);
+    db_bytes.extend_from_slice(&mhsd_playlists_type2);
+
+    let iv = [0x26u8; 16];
+    let rand12 = [0xD5u8; 12];
+    let sha1 = compute_itunesdb_sha1_for_hash72(&db_bytes);
+    let sig72 = generate_hash72(&sha1, &iv, &rand12);
+    db_bytes[0x72..0x72 + 46].copy_from_slice(&sig72);
+    assert_eq!(extract_hash72_params(&db_bytes), Some((iv, rand12)));
+
+    let itunesdb_path = mount_path
+        .join("iPod_Control")
+        .join("iTunes")
+        .join("iTunesDB");
+    fs::write(&itunesdb_path, &db_bytes).expect("write initial iTunesDB");
+
+    let host_temp = TempDir::new().expect("create host temp");
+    let mp3_path = host_temp.path().join("02 - New Song.mp3");
+    fs::write(
+        &mp3_path,
+        build_id3v23_mp3_fixture("New Song", "New Artist", "New Album", 2, "Pop", 2025, 4),
+    )
+    .expect("write mp3");
+
+    let adapter = FakeHardwareAdapter {
+        volumes: vec![MountedVolume {
+            mount_path: mount_path.clone(),
+            volume_name: "IPOD".to_string(),
+            total_bytes: 160_000_000_000,
+            free_bytes: 100_000_000_000,
+            usb_firewire_guid: None,
+        }],
+    };
+    let mut engine = PodLoaderEngine::new(adapter);
+    engine.stage_host_paths(&[mp3_path], None).expect("stage");
+    let outcome = engine.commit_sync_batch().expect("commit");
+    match outcome {
+        CommitOutcome::Completed(session) => {
+            assert_eq!(session.library.tracks.len(), 2);
+            // UI playlists should not be duplicated even though both mhsd type 3 and type 2 exist
+            assert_eq!(session.library.playlists.len(), 1);
+            assert_eq!(session.library.playlists[0].track_ids.len(), 2);
+        }
+        other => panic!("expected Completed, got {:?}", other),
+    }
+
+    let updated_bytes = fs::read(&itunesdb_path).expect("read updated iTunesDB");
+    // Verify hash72 was re-signed with the extracted (iv, rand12) even without FireWireGuid!
+    assert_eq!(
+        extract_hash72_params(&updated_bytes),
+        Some((iv, rand12)),
+        "expected updated iTunesDB to have a valid re-signed hash72"
+    );
+}
+
 
 
 
