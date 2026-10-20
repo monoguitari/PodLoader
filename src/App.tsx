@@ -3,7 +3,12 @@ import type {
   DeviceConnectionState,
   DevicePlaylist,
   DeviceTrack,
+  DuplicateResolution,
+  HostDirectoryListing,
+  InterruptedBatchSummary,
+  InterruptedResolution,
   PodLoaderBridge,
+  SyncBatch,
 } from "./bridge";
 
 export interface AppProps {
@@ -31,6 +36,28 @@ interface PlaylistSectionProps {
   playlists: DevicePlaylist[];
   selectedPlaylistId?: number;
   onSelect: (id: number) => void;
+  onDropPaths?: (paths: string[], targetPlaylistId: number | null) => void;
+}
+
+function extractDroppedPaths(dataTransfer: DataTransfer): string[] {
+  const custom = dataTransfer.getData("text/podloader-path");
+  if (custom) {
+    return custom
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  const plain = dataTransfer.getData("text/plain");
+  if (plain) {
+    return plain
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  const files = Array.from(dataTransfer.files ?? []);
+  return files
+    .map((f) => (f as File & { path?: string }).path || f.name)
+    .filter(Boolean);
 }
 
 function PlaylistSection({
@@ -38,13 +65,27 @@ function PlaylistSection({
   playlists,
   selectedPlaylistId,
   onSelect,
+  onDropPaths,
 }: PlaylistSectionProps) {
   return (
     <section>
       <h2>{title}</h2>
       <ul>
         {playlists.map((pl) => (
-          <li key={pl.id}>
+          <li
+            key={pl.id}
+            onDragOver={(e) => {
+              e.preventDefault();
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              if (!onDropPaths) return;
+              const paths = extractDroppedPaths(e.dataTransfer);
+              if (paths.length > 0) {
+                onDropPaths(paths, pl.kind === "user" ? pl.id : null);
+              }
+            }}
+          >
             <button
               type="button"
               aria-pressed={selectedPlaylistId === pl.id}
@@ -67,17 +108,33 @@ export function App({ bridge }: AppProps) {
     null,
   );
   const [initDeviceName, setInitDeviceName] = useState<string>("My iPod");
+  const [hostPathInput, setHostPathInput] = useState<string>("/music");
+  const [hostListing, setHostListing] = useState<HostDirectoryListing | null>(
+    null,
+  );
+  const [syncBatch, setSyncBatch] = useState<SyncBatch>({
+    additions: [],
+    requiredBytes: 0,
+  });
+  const [interruptedBatch, setInterruptedBatch] =
+    useState<InterruptedBatchSummary | null>(null);
+  const [manualGuidInput, setManualGuidInput] = useState<string>("");
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const applyConnectionState = useCallback((state: DeviceConnectionState) => {
     setConnection(state);
     if (state.status === "uninitializedVolume") {
       setInitDeviceName(state.data.volumeName || "My iPod");
     } else if (state.status === "connected") {
+      setSyncBatch(
+        state.data.syncBatch ?? { additions: [], requiredBytes: 0 },
+      );
+      setInterruptedBatch(state.data.interruptedBatch ?? null);
       const master =
         state.data.library.playlists.find((p) => p.kind === "master") ??
         state.data.library.playlists[0];
       if (master) {
-        setSelectedPlaylistId(master.id);
+        setSelectedPlaylistId((prev) => prev ?? master.id);
       }
     }
   }, []);
@@ -89,6 +146,20 @@ export function App({ bridge }: AppProps) {
         applyConnectionState(state);
       }
     });
+    if (bridge.browseHostDirectory) {
+      const browse = bridge.browseHostDirectory.bind(bridge);
+      browse("/music")
+        .catch(() => browse("."))
+        .then((listing) => {
+          if (active && listing && Array.isArray(listing.files)) {
+            setHostListing(listing);
+            setHostPathInput(listing.currentPath);
+          }
+        })
+        .catch(() => {
+          // Ignore initial browse error if default folder doesn't exist
+        });
+    }
     return () => {
       active = false;
     };
@@ -163,6 +234,101 @@ export function App({ bridge }: AppProps) {
   const userPlaylists = library.playlists.filter((p) => p.kind === "user");
   const smartPlaylists = library.playlists.filter((p) => p.kind === "smart");
 
+  const handleBrowseHost = async (targetPath: string) => {
+    if (!bridge.browseHostDirectory) return;
+    try {
+      const listing = await bridge.browseHostDirectory(targetPath);
+      setHostListing(listing);
+      setHostPathInput(listing.currentPath);
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleStagePaths = async (
+    paths: string[],
+    explicitPlaylistId?: number | null,
+  ) => {
+    if (!bridge.stageHostPaths || paths.length === 0) return;
+    try {
+      const prevCount = syncBatch.additions.length;
+      const targetId =
+        explicitPlaylistId !== undefined
+          ? explicitPlaylistId
+          : selectedPlaylist && selectedPlaylist.kind === "user"
+            ? selectedPlaylist.id
+            : null;
+      const updatedBatch = await bridge.stageHostPaths(paths, targetId);
+      setSyncBatch(updatedBatch);
+      if (updatedBatch.additions.length === prevCount) {
+        setErrorMessage(
+          "No new iPod-native audio files (MP3, M4A, AAC, ALAC, WAV) were found to stage in the selected path.",
+        );
+      } else {
+        setErrorMessage(null);
+      }
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleDuplicateResolutionChange = async (
+    stagedId: number,
+    resolution: DuplicateResolution,
+  ) => {
+    if (!bridge.setDuplicateResolution) return;
+    const updatedBatch = await bridge.setDuplicateResolution(
+      stagedId,
+      resolution,
+    );
+    setSyncBatch(updatedBatch);
+  };
+
+  const handleSaveManualGuid = async () => {
+    if (!bridge.setManualFirewireGuid || !manualGuidInput.trim()) return;
+    try {
+      const updatedSession = await bridge.setManualFirewireGuid(
+        manualGuidInput.trim(),
+      );
+      applyConnectionState({ status: "connected", data: updatedSession });
+      setManualGuidInput("");
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleCommitBatch = async (maxTracksBeforeInterrupt?: number) => {
+    if (!bridge.commitSyncBatch) return;
+    try {
+      const outcome = await bridge.commitSyncBatch(
+        maxTracksBeforeInterrupt !== undefined
+          ? { maxTracksBeforeInterrupt }
+          : undefined,
+      );
+      if (outcome.outcome === "completed") {
+        applyConnectionState({ status: "connected", data: outcome.data });
+      } else {
+        setInterruptedBatch(outcome.data);
+      }
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleResolveInterrupted = async (resolution: InterruptedResolution) => {
+    if (!bridge.resolveInterruptedBatch) return;
+    try {
+      const updatedSession = await bridge.resolveInterruptedBatch(resolution);
+      applyConnectionState({ status: "connected", data: updatedSession });
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
+
   return (
     <div className="podloader-shell">
       <header className="device-header">
@@ -174,6 +340,20 @@ export function App({ bridge }: AppProps) {
               <span>FireWire GUID: {device.firewireGuid}</span>
             )}
           </p>
+          <div className="guid-controls">
+            <label htmlFor="manual-guid-input">Manual FireWire GUID</label>
+            <input
+              id="manual-guid-input"
+              aria-label="Manual FireWire GUID"
+              type="text"
+              placeholder="16-char hex GUID"
+              value={manualGuidInput}
+              onChange={(e) => setManualGuidInput(e.target.value)}
+            />
+            <button type="button" onClick={handleSaveManualGuid}>
+              Save GUID
+            </button>
+          </div>
         </div>
         <div className="storage-summary">
           <span>{formatGigabytes(device.usedBytes)} used</span>
@@ -183,19 +363,142 @@ export function App({ bridge }: AppProps) {
         </div>
       </header>
 
+      {errorMessage && (
+        <div role="alert" className="error-banner">
+          {errorMessage}
+        </div>
+      )}
+
       <div className="workspace">
+        <aside aria-label="Host File Browser" className="host-browser-pane">
+          <h2>Host Files</h2>
+          <div className="host-path-bar">
+            <label htmlFor="host-path-input">Host Folder</label>
+            <input
+              id="host-path-input"
+              type="text"
+              value={hostPathInput}
+              onChange={(e) => setHostPathInput(e.target.value)}
+            />
+            <button
+              type="button"
+              onClick={() => handleBrowseHost(hostPathInput)}
+            >
+              Browse
+            </button>
+            {hostListing?.parentPath && (
+              <button
+                type="button"
+                onClick={() =>
+                  hostListing.parentPath &&
+                  handleBrowseHost(hostListing.parentPath)
+                }
+              >
+                ⬆️ Parent Folder
+              </button>
+            )}
+            {(hostListing?.files?.length ?? 0) > 0 && (
+              <button
+                type="button"
+                onClick={() =>
+                  handleStagePaths(
+                    (hostListing?.files ?? []).map((f) => f.path),
+                  )
+                }
+              >
+                Stage All to Sync Batch
+              </button>
+            )}
+          </div>
+
+          {(hostListing?.subdirectories?.length ?? 0) > 0 && (
+            <ul className="host-subdirs">
+              {(hostListing?.subdirectories ?? []).map((dir) => (
+                <li
+                  key={dir.path}
+                  draggable
+                  onDragStart={(e) => {
+                    e.dataTransfer.setData("text/podloader-path", dir.path);
+                    e.dataTransfer.setData("text/plain", dir.path);
+                  }}
+                >
+                  <button
+                    type="button"
+                    onClick={() => handleBrowseHost(dir.path)}
+                  >
+                    📁 {dir.name}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleStagePaths([dir.path])}
+                  >
+                    Stage Folder
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          <table aria-label="Host Files">
+            <thead>
+              <tr>
+                <th>Track #</th>
+                <th>Title</th>
+                <th>Artist</th>
+                <th>Album</th>
+                <th>Duration</th>
+                <th>Format</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(hostListing?.files ?? []).map((hf) => (
+                <tr
+                  key={hf.path}
+                  draggable
+                  onDragStart={(e) => {
+                    e.dataTransfer.setData("text/podloader-path", hf.path);
+                    e.dataTransfer.setData("text/plain", hf.path);
+                  }}
+                >
+                  <td>{hf.trackNumber}</td>
+                  <td>{hf.title}</td>
+                  <td>{hf.artist}</td>
+                  <td>{hf.album}</td>
+                  <td>{formatDuration(hf.durationMs)}</td>
+                  <td>{hf.format}</td>
+                  <td>
+                    <button
+                      type="button"
+                      onClick={() => handleStagePaths([hf.path])}
+                    >
+                      Stage
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </aside>
+
         <nav aria-label="Device Playlists" className="playlist-sidebar">
           <PlaylistSection
             title="Master Playlist"
             playlists={masterPlaylists}
             selectedPlaylistId={selectedPlaylist?.id}
             onSelect={setSelectedPlaylistId}
+            onDropPaths={(paths, targetId) =>
+              handleStagePaths(paths, targetId)
+            }
           />
           <PlaylistSection
             title="Device Playlists"
             playlists={userPlaylists}
             selectedPlaylistId={selectedPlaylist?.id}
             onSelect={setSelectedPlaylistId}
+            onDropPaths={(paths, targetId) =>
+              handleStagePaths(paths, targetId)
+            }
           />
           <PlaylistSection
             title="Smart Playlists"
@@ -205,7 +508,97 @@ export function App({ bridge }: AppProps) {
           />
         </nav>
 
-        <main className="track-pane">
+        <main
+          className="track-pane"
+          aria-label="Device Library"
+          onDragOver={(e) => {
+            e.preventDefault();
+          }}
+          onDrop={(e) => {
+            e.preventDefault();
+            const paths = extractDroppedPaths(e.dataTransfer);
+            if (paths.length > 0) {
+              handleStagePaths(paths);
+            }
+          }}
+        >
+          {syncBatch.additions.length > 0 && (
+            <section aria-label="Sync Batch" className="sync-batch-panel">
+              <h2>
+                Sync Batch ({syncBatch.additions.length} staged,{" "}
+                {formatGigabytes(syncBatch.requiredBytes)} required)
+              </h2>
+
+              {interruptedBatch && (
+                <div role="alert" className="interrupted-batch-prompt">
+                  <p>
+                    Transfer paused: {interruptedBatch.reason} (
+                    {interruptedBatch.completedTrackCount} completed,{" "}
+                    {interruptedBatch.remainingTrackCount} remaining)
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      handleResolveInterrupted("commitCompleted")
+                    }
+                  >
+                    Commit Completed Tracks
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleResolveInterrupted("rollBack")}
+                  >
+                    Roll Back Batch
+                  </button>
+                </div>
+              )}
+
+              <ul>
+                {syncBatch.additions.map((item) => (
+                  <li key={item.stagedId}>
+                    <span>
+                      {item.hostFile.artist} — {item.hostFile.title} (
+                      {item.hostFile.format})
+                    </span>
+                    {item.isDuplicate && (
+                      <>
+                        <span className="duplicate-badge">Duplicate</span>
+                        <select
+                          aria-label={`Duplicate resolution for ${item.hostFile.title}`}
+                          value={item.duplicateResolution}
+                          onChange={(e) =>
+                            handleDuplicateResolutionChange(
+                              item.stagedId,
+                              e.target.value as DuplicateResolution,
+                            )
+                          }
+                        >
+                          <option value="skip">Skip</option>
+                          <option value="importAnyway">Import Anyway</option>
+                          <option value="replaceExisting">
+                            Replace Existing
+                          </option>
+                        </select>
+                      </>
+                    )}
+                  </li>
+                ))}
+              </ul>
+
+              <div className="sync-batch-actions">
+                <button type="button" onClick={() => handleCommitBatch()}>
+                  Commit Sync Batch
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleCommitBatch(1)}
+                >
+                  Pause After First Track
+                </button>
+              </div>
+            </section>
+          )}
+
           <table aria-label="Device Tracks">
             <thead>
               <tr>

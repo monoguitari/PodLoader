@@ -1,14 +1,36 @@
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, test } from "vitest";
 import { App } from "./App";
-import type { DeviceConnectionState, PodLoaderBridge } from "./bridge";
+import type {
+  CommitOutcome,
+  DeviceConnectionState,
+  DeviceSession,
+  DuplicateResolution,
+  HostDirectoryListing,
+  HostFile,
+  InterruptedResolution,
+  PodLoaderBridge,
+  SyncBatch,
+} from "./bridge";
 
 class InMemoryPodLoaderBridge implements PodLoaderBridge {
-  private state: DeviceConnectionState;
+  public state: DeviceConnectionState;
+  private hostListing: HostDirectoryListing;
+  private nextStagedId = 1;
+  public shouldInterruptNextCommit = false;
 
-  constructor(initialState: DeviceConnectionState) {
+  constructor(
+    initialState: DeviceConnectionState,
+    hostListing?: HostDirectoryListing,
+  ) {
     this.state = initialState;
+    this.hostListing = hostListing ?? {
+      currentPath: "/music",
+      parentPath: "/",
+      subdirectories: [{ name: "OK Computer", path: "/music/OK Computer" }],
+      files: [],
+    };
   }
 
   async scanDevice(): Promise<DeviceConnectionState> {
@@ -43,9 +65,212 @@ class InMemoryPodLoaderBridge implements PodLoaderBridge {
           ],
         },
         hasPendingPlayCounts: false,
+        syncBatch: { additions: [], requiredBytes: 0 },
+        interruptedBatch: null,
       },
     };
     return this.state;
+  }
+
+  async browseHostDirectory(_dirPath: string): Promise<HostDirectoryListing> {
+    return this.hostListing;
+  }
+
+  async stageHostPaths(
+    paths: string[],
+    targetPlaylistId?: number | null,
+  ): Promise<SyncBatch> {
+    if (this.state.status !== "connected") {
+      throw new Error("No active device");
+    }
+    const session = this.state.data;
+    const batch: SyncBatch = session.syncBatch ?? {
+      additions: [],
+      requiredBytes: 0,
+    };
+
+    const matchedFiles: HostFile[] = this.hostListing.files.filter((f) =>
+      paths.includes(f.path),
+    );
+    for (const hf of matchedFiles) {
+      const existing = session.library.tracks.find(
+        (dt) =>
+          dt.artist.toLowerCase() === hf.artist.toLowerCase() &&
+          dt.album.toLowerCase() === hf.album.toLowerCase() &&
+          dt.title.toLowerCase() === hf.title.toLowerCase() &&
+          dt.trackNumber === hf.trackNumber,
+      );
+      const isDuplicate = Boolean(existing);
+      batch.additions.push({
+        stagedId: this.nextStagedId++,
+        hostFile: hf,
+        targetPlaylistId: targetPlaylistId ?? null,
+        isDuplicate,
+        matchedDeviceTrackId: existing?.id ?? null,
+        duplicateResolution: isDuplicate ? "skip" : "importAnyway",
+      });
+    }
+
+    batch.requiredBytes = batch.additions
+      .filter((a) => !a.isDuplicate || a.duplicateResolution !== "skip")
+      .reduce((sum, a) => sum + a.hostFile.fileSize, 0);
+    session.syncBatch = { ...batch, additions: [...batch.additions] };
+    return session.syncBatch;
+  }
+
+  async setDuplicateResolution(
+    stagedId: number,
+    resolution: DuplicateResolution,
+  ): Promise<SyncBatch> {
+    if (this.state.status !== "connected") {
+      throw new Error("No active device");
+    }
+    const session = this.state.data;
+    const batch = session.syncBatch ?? { additions: [], requiredBytes: 0 };
+    const additions = batch.additions.map((a) =>
+      a.stagedId === stagedId ? { ...a, duplicateResolution: resolution } : a,
+    );
+    const requiredBytes = additions
+      .filter((a) => !a.isDuplicate || a.duplicateResolution !== "skip")
+      .reduce((sum, a) => sum + a.hostFile.fileSize, 0);
+    session.syncBatch = { additions, requiredBytes };
+    return session.syncBatch;
+  }
+
+  async commitSyncBatch(options?: {
+    maxTracksBeforeInterrupt?: number;
+  }): Promise<CommitOutcome> {
+    if (this.state.status !== "connected") {
+      throw new Error("No active device");
+    }
+    const session = this.state.data;
+    const batch = session.syncBatch ?? { additions: [], requiredBytes: 0 };
+
+    if (batch.requiredBytes > session.device.freeBytes) {
+      throw new Error(
+        `InsufficientDiskSpace: required ${batch.requiredBytes} bytes, available ${session.device.freeBytes} bytes`,
+      );
+    }
+
+    if (
+      this.shouldInterruptNextCommit ||
+      options?.maxTracksBeforeInterrupt !== undefined
+    ) {
+      this.shouldInterruptNextCommit = false;
+      const summary = {
+        completedTrackCount: 1,
+        remainingTrackCount: Math.max(0, batch.additions.length - 1),
+        writtenObfuscatedPaths: [":iPod_Control:Music:F01:ABCD.mp3"],
+        reason: "Transfer paused after 1 track",
+      };
+      session.interruptedBatch = summary;
+      return { outcome: "interrupted", data: summary };
+    }
+
+    for (const item of batch.additions) {
+      if (item.isDuplicate && item.duplicateResolution === "skip") {
+        continue;
+      }
+      if (
+        item.isDuplicate &&
+        item.duplicateResolution === "replaceExisting" &&
+        item.matchedDeviceTrackId != null
+      ) {
+        const idx = session.library.tracks.findIndex(
+          (t) => t.id === item.matchedDeviceTrackId,
+        );
+        if (idx >= 0) {
+          session.library.tracks[idx] = {
+            ...session.library.tracks[idx],
+            title: item.hostFile.title,
+            artist: item.hostFile.artist,
+            album: item.hostFile.album,
+            trackNumber: item.hostFile.trackNumber,
+            discNumber: item.hostFile.discNumber,
+            genre: item.hostFile.genre,
+            year: item.hostFile.year,
+            durationMs: item.hostFile.durationMs,
+            bitrateKbps: item.hostFile.bitrateKbps,
+            obfuscatedPath: `:iPod_Control:Music:F00:R${item.stagedId}.mp3`,
+          };
+          continue;
+        }
+      }
+
+      const newId = 500 + item.stagedId;
+      session.library.tracks.push({
+        id: newId,
+        title: item.hostFile.title,
+        artist: item.hostFile.artist,
+        album: item.hostFile.album,
+        trackNumber: item.hostFile.trackNumber,
+        discNumber: item.hostFile.discNumber,
+        genre: item.hostFile.genre,
+        year: item.hostFile.year,
+        durationMs: item.hostFile.durationMs,
+        bitrateKbps: item.hostFile.bitrateKbps,
+        playCount: 0,
+        rating: 0,
+        bookmarkMs: 0,
+        obfuscatedPath: `:iPod_Control:Music:F00:T${item.stagedId}.mp3`,
+      });
+      for (const pl of session.library.playlists) {
+        if (pl.kind === "master" || pl.id === item.targetPlaylistId) {
+          if (!pl.trackIds.includes(newId)) {
+            pl.trackIds.push(newId);
+          }
+        }
+      }
+    }
+
+    session.syncBatch = { additions: [], requiredBytes: 0 };
+    session.interruptedBatch = null;
+    return { outcome: "completed", data: { ...session } };
+  }
+
+  async resolveInterruptedBatch(
+    resolution: InterruptedResolution,
+  ): Promise<DeviceSession> {
+    if (this.state.status !== "connected") {
+      throw new Error("No active device");
+    }
+    const session = this.state.data;
+    if (resolution === "commitCompleted") {
+      const first = session.syncBatch?.additions[0];
+      if (first) {
+        session.library.tracks.push({
+          id: 901,
+          title: first.hostFile.title,
+          artist: first.hostFile.artist,
+          album: first.hostFile.album,
+          trackNumber: first.hostFile.trackNumber,
+          discNumber: first.hostFile.discNumber,
+          genre: first.hostFile.genre,
+          year: first.hostFile.year,
+          durationMs: first.hostFile.durationMs,
+          bitrateKbps: first.hostFile.bitrateKbps,
+          playCount: 0,
+          rating: 0,
+          bookmarkMs: 0,
+          obfuscatedPath: ":iPod_Control:Music:F01:ABCD.mp3",
+        });
+        session.library.playlists[0].trackIds.push(901);
+        session.syncBatch = {
+          additions: session.syncBatch?.additions.slice(1) ?? [],
+          requiredBytes: 0,
+        };
+      }
+    }
+    session.interruptedBatch = null;
+    return { ...session };
+  }
+
+  async setManualFirewireGuid(guid: string): Promise<DeviceSession> {
+    if (this.state.status !== "connected") {
+      throw new Error("No active device");
+    }
+    this.state.data.device.firewireGuid = guid;
+    return { ...this.state.data };
   }
 }
 
@@ -209,5 +434,204 @@ describe("PodLoaderBridge React UI Seam", () => {
       within(sidebar).getByRole("button", { name: /Fresh Classic/i }),
     ).toBeInTheDocument();
     expect(screen.getByText(/29\.9 GB free/i)).toBeInTheDocument();
+  });
+
+  test("browses Host Files, stages tracks into Sync Batch with duplicate resolution toggles, handles mid-batch recovery, and commits to Device Library", async () => {
+    const user = userEvent.setup();
+    const bridge = new InMemoryPodLoaderBridge(
+      {
+        status: "connected",
+        data: {
+          device: {
+            mountPath: "/Volumes/IPOD",
+            name: "Classic 160GB",
+            modelNumber: "MC297",
+            firewireGuid: null,
+            totalBytes: 160_000_000_000,
+            freeBytes: 120_000_000_000,
+            usedBytes: 40_000_000_000,
+          },
+          library: {
+            tracks: [
+              {
+                id: 101,
+                title: "Paranoid Android",
+                artist: "Radiohead",
+                album: "OK Computer",
+                trackNumber: 2,
+                discNumber: 1,
+                genre: "Alternative",
+                year: 1997,
+                durationMs: 383_000,
+                bitrateKbps: 320,
+                playCount: 10,
+                rating: 5,
+                bookmarkMs: 0,
+                obfuscatedPath: ":iPod_Control:Music:F04:ABCD.mp3",
+              },
+            ],
+            playlists: [
+              {
+                id: 1000,
+                name: "Classic 160GB",
+                kind: "master",
+                trackIds: [101],
+              },
+              {
+                id: 2000,
+                name: "Favorites",
+                kind: "user",
+                trackIds: [],
+              },
+            ],
+          },
+          hasPendingPlayCounts: false,
+          syncBatch: { additions: [], requiredBytes: 0 },
+          interruptedBatch: null,
+        },
+      },
+      {
+        currentPath: "/music/OK Computer",
+        parentPath: "/music",
+        subdirectories: [],
+        files: [
+          {
+            path: "/music/OK Computer/02 - Paranoid Android.mp3",
+            fileName: "02 - Paranoid Android.mp3",
+            format: "MP3",
+            fileSize: 8_000_000,
+            title: "Paranoid Android",
+            artist: "Radiohead",
+            album: "OK Computer",
+            trackNumber: 2,
+            discNumber: 1,
+            genre: "Alternative",
+            year: 1997,
+            durationMs: 383_000,
+            bitrateKbps: 320,
+          },
+          {
+            path: "/music/OK Computer/06 - Karma Police.mp3",
+            fileName: "06 - Karma Police.mp3",
+            format: "MP3",
+            fileSize: 6_500_000,
+            title: "Karma Police",
+            artist: "Radiohead",
+            album: "OK Computer",
+            trackNumber: 6,
+            discNumber: 1,
+            genre: "Alternative",
+            year: 1997,
+            durationMs: 264_000,
+            bitrateKbps: 320,
+          },
+        ],
+      },
+    );
+
+    render(<App bridge={bridge} />);
+
+    // 1. Host File Browser pane displays local audio files and their tags
+    const hostTable = await screen.findByRole("table", { name: /Host Files/i });
+    expect(within(hostTable).getByText("Karma Police")).toBeInTheDocument();
+    expect(within(hostTable).getAllByText("MP3").length).toBeGreaterThan(0);
+
+    // 2. Manual FireWire GUID entry when Device lacks one
+    const guidInput = screen.getByLabelText(/Manual FireWire GUID/i);
+    await user.type(guidInput, "000A270011223344");
+    await user.click(screen.getByRole("button", { name: /Save GUID/i }));
+    expect(await screen.findByText(/000A270011223344/)).toBeInTheDocument();
+
+    // 3. Drag a Host File onto the "Favorites" Device Playlist to stage it
+    const favoritesPlaylistButton = screen.getByRole("button", {
+      name: /Favorites \(0\)/i,
+    });
+    const favoritesPlaylistItem = favoritesPlaylistButton.closest("li")!;
+    fireEvent.drop(favoritesPlaylistItem, {
+      dataTransfer: {
+        getData: (type: string) =>
+          type === "text/podloader-path"
+            ? "/music/OK Computer/02 - Paranoid Android.mp3"
+            : "",
+        files: [],
+      },
+    });
+
+    // Also stage the remaining Host File ("Karma Police")
+    const karmaRow = within(hostTable)
+      .getByText("Karma Police")
+      .closest("tr")!;
+    await user.click(within(karmaRow).getByRole("button", { name: /Stage/i }));
+
+    const syncBatchRegion = await screen.findByRole("region", {
+      name: /Sync Batch/i,
+    });
+    expect(
+      within(syncBatchRegion).getByText(/Duplicate/i),
+    ).toBeInTheDocument();
+
+    // Change duplicate resolution from "Skip" to "Replace Existing"
+    const resolutionSelect = within(syncBatchRegion).getByLabelText(
+      /Duplicate resolution for Paranoid Android/i,
+    );
+    expect(resolutionSelect).toHaveValue("skip");
+    await user.selectOptions(resolutionSelect, "replaceExisting");
+    expect(resolutionSelect).toHaveValue("replaceExisting");
+
+    // 4. Verify pre-flight free-space rejection when Device lacks space
+    if (bridge.state.status === "connected") {
+      bridge.state.data.device.freeBytes = 1_000_000; // 1 MB free (< 14.5 MB required)
+    }
+    await user.click(
+      within(syncBatchRegion).getByRole("button", {
+        name: /Commit Sync Batch/i,
+      }),
+    );
+    expect(
+      await screen.findByRole("alert"),
+    ).toHaveTextContent(/InsufficientDiskSpace/i);
+
+    // Restore sufficient free space on Device
+    if (bridge.state.status === "connected") {
+      bridge.state.data.device.freeBytes = 60_000_000_000;
+    }
+
+    // 5. Pause mid-batch after first track -> test Roll Back Batch first
+    await user.click(
+      within(syncBatchRegion).getByRole("button", {
+        name: /Pause After First Track/i,
+      }),
+    );
+    expect(
+      await screen.findByText(/Transfer paused after 1 track/i),
+    ).toBeInTheDocument();
+    await user.click(
+      screen.getByRole("button", { name: /Roll Back Batch/i }),
+    );
+
+    // 6. Pause mid-batch again -> test Commit Completed Tracks
+    await user.click(
+      within(syncBatchRegion).getByRole("button", {
+        name: /Pause After First Track/i,
+      }),
+    );
+    expect(
+      await screen.findByText(/Transfer paused after 1 track/i),
+    ).toBeInTheDocument();
+    await user.click(
+      screen.getByRole("button", { name: /Commit Completed Tracks/i }),
+    );
+
+    // 7. Commit remaining track and verify Device Tracks table shows the newly added track
+    await user.click(
+      within(syncBatchRegion).getByRole("button", {
+        name: /Commit Sync Batch/i,
+      }),
+    );
+
+    const deviceTable = screen.getByRole("table", { name: /Device Tracks/i });
+    expect(
+      await within(deviceTable).findByText("Karma Police"),
+    ).toBeInTheDocument();
   });
 });

@@ -1,5 +1,5 @@
 use crate::playcounts::PlayCountEntry;
-use crate::{DeviceLibrary, DevicePlaylist, DeviceTrack, PlaylistKind, PodLoaderError};
+use crate::{DeviceLibrary, DevicePlaylist, DeviceTrack, HostFile, PlaylistKind, PodLoaderError};
 
 #[derive(Debug, Clone)]
 struct MhodChunk {
@@ -291,6 +291,203 @@ impl ItunesDb {
                 }
             }
         }
+    }
+
+    pub fn ensure_mhbd_header_min_len(&mut self, min_len: usize) {
+        if self.mhbd_header_bytes.len() < min_len {
+            self.mhbd_header_bytes.resize(min_len, 0);
+            let len_u32 = min_len as u32;
+            self.mhbd_header_bytes[4..8].copy_from_slice(&len_u32.to_le_bytes());
+        }
+    }
+
+    pub fn next_track_id(&self) -> u32 {
+        let mut max_id = 100u32;
+        for ds in &self.datasets {
+            if let MhsdBody::TrackList { tracks, .. } = &ds.body {
+                for t in tracks {
+                    if t.track.id > max_id {
+                        max_id = t.track.id;
+                    }
+                }
+            }
+        }
+        max_id + 1
+    }
+
+    pub fn upsert_transferred_track(
+        &mut self,
+        host_file: &HostFile,
+        obfuscated_path: &str,
+        replace_track_id: Option<u32>,
+        target_playlist_id: Option<u64>,
+    ) -> (u32, Option<String>) {
+        if let Some(existing_id) = replace_track_id {
+            for ds in &mut self.datasets {
+                if let MhsdBody::TrackList { tracks, .. } = &mut ds.body {
+                    if let Some(chunk) = tracks.iter_mut().find(|c| c.track.id == existing_id) {
+                        let old_path = chunk.track.obfuscated_path.clone();
+                        chunk.track.title = host_file.title.clone();
+                        chunk.track.artist = host_file.artist.clone();
+                        chunk.track.album = host_file.album.clone();
+                        chunk.track.genre = host_file.genre.clone();
+                        chunk.track.track_number = host_file.track_number;
+                        chunk.track.disc_number = host_file.disc_number;
+                        chunk.track.year = host_file.year;
+                        chunk.track.duration_ms = host_file.duration_ms;
+                        chunk.track.bitrate_kbps = host_file.bitrate_kbps;
+                        chunk.track.obfuscated_path = obfuscated_path.to_string();
+
+                        write_mhit_track_metadata(&mut chunk.header_bytes, host_file);
+
+                        // Preserve unknown mhods (types outside 1..=5) while updating string mhods 1..=5
+                        let preserved: Vec<MhodChunk> = chunk
+                            .mhods
+                            .iter()
+                            .filter(|m| !(1..=5).contains(&m.mhod_type))
+                            .cloned()
+                            .collect();
+                        let mut new_mhods = build_track_string_mhods(host_file, obfuscated_path);
+                        new_mhods.extend(preserved);
+                        chunk.mhods = new_mhods;
+
+                        self.append_track_to_playlists(existing_id, target_playlist_id);
+                        return (existing_id, Some(old_path));
+                    }
+                }
+            }
+        }
+
+        let new_id = self.next_track_id();
+        let new_chunk = build_new_mhit_chunk(new_id, host_file, obfuscated_path);
+        for ds in &mut self.datasets {
+            if let MhsdBody::TrackList { tracks, .. } = &mut ds.body {
+                tracks.push(new_chunk);
+                break;
+            }
+        }
+        self.append_track_to_playlists(new_id, target_playlist_id);
+        (new_id, None)
+    }
+
+    fn append_track_to_playlists(&mut self, track_id: u32, target_playlist_id: Option<u64>) {
+        for ds in &mut self.datasets {
+            if let MhsdBody::PlaylistList { playlists, .. } = &mut ds.body {
+                for pl in playlists {
+                    let should_add = pl.playlist.kind == PlaylistKind::Master
+                        || target_playlist_id == Some(pl.playlist.id);
+                    if should_add && !pl.playlist.track_ids.contains(&track_id) {
+                        let next_pos = (pl.mhips.len() as u32) + 1;
+                        pl.mhips.push(build_new_mhip_chunk(track_id, next_pos));
+                        pl.playlist.track_ids.push(track_id);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn build_track_string_mhods(host_file: &HostFile, obfuscated_path: &str) -> Vec<MhodChunk> {
+    vec![
+        MhodChunk {
+            mhod_type: 1,
+            raw_bytes: encode_string_mhod(1, &host_file.title),
+        },
+        MhodChunk {
+            mhod_type: 4,
+            raw_bytes: encode_string_mhod(4, &host_file.artist),
+        },
+        MhodChunk {
+            mhod_type: 3,
+            raw_bytes: encode_string_mhod(3, &host_file.album),
+        },
+        MhodChunk {
+            mhod_type: 5,
+            raw_bytes: encode_string_mhod(5, &host_file.genre),
+        },
+        MhodChunk {
+            mhod_type: 2,
+            raw_bytes: encode_string_mhod(2, obfuscated_path),
+        },
+    ]
+}
+
+fn write_mhit_track_metadata(header_bytes: &mut [u8], host_file: &HostFile) {
+    if header_bytes.len() >= 96 {
+        header_bytes[36..40].copy_from_slice(&(host_file.file_size as u32).to_le_bytes());
+        header_bytes[40..44].copy_from_slice(&host_file.duration_ms.to_le_bytes());
+        header_bytes[44..48].copy_from_slice(&host_file.track_number.to_le_bytes());
+        header_bytes[52..56].copy_from_slice(&host_file.year.to_le_bytes());
+        header_bytes[56..60].copy_from_slice(&host_file.bitrate_kbps.to_le_bytes());
+        header_bytes[92..96].copy_from_slice(&host_file.disc_number.to_le_bytes());
+    }
+}
+
+fn build_new_mhit_chunk(track_id: u32, host_file: &HostFile, obfuscated_path: &str) -> MhitChunk {
+    let mhods = build_track_string_mhods(host_file, obfuscated_path);
+    let header_len = 244u32;
+    let body_len: usize = mhods.iter().map(|m| m.raw_bytes.len()).sum();
+    let total_len = header_len + body_len as u32;
+
+    let mut header_bytes = vec![0u8; header_len as usize];
+    header_bytes[0..4].copy_from_slice(b"mhit");
+    header_bytes[4..8].copy_from_slice(&header_len.to_le_bytes());
+    header_bytes[8..12].copy_from_slice(&total_len.to_le_bytes());
+    header_bytes[12..16].copy_from_slice(&(mhods.len() as u32).to_le_bytes());
+    header_bytes[16..20].copy_from_slice(&track_id.to_le_bytes());
+    header_bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+    write_mhit_track_metadata(&mut header_bytes, host_file);
+
+    MhitChunk {
+        header_bytes,
+        mhods,
+        track: DeviceTrack {
+            id: track_id,
+            title: host_file.title.clone(),
+            artist: host_file.artist.clone(),
+            album: host_file.album.clone(),
+            track_number: host_file.track_number,
+            disc_number: host_file.disc_number,
+            genre: host_file.genre.clone(),
+            year: host_file.year,
+            duration_ms: host_file.duration_ms,
+            bitrate_kbps: host_file.bitrate_kbps,
+            play_count: 0,
+            rating: 0,
+            last_played_timestamp: None,
+            bookmark_ms: 0,
+            obfuscated_path: obfuscated_path.to_string(),
+        },
+    }
+}
+
+fn build_new_mhip_chunk(track_id: u32, order_position: u32) -> MhipChunk {
+    let mut order_raw = vec![0u8; 28];
+    order_raw[0..4].copy_from_slice(b"mhod");
+    order_raw[4..8].copy_from_slice(&24u32.to_le_bytes());
+    order_raw[8..12].copy_from_slice(&28u32.to_le_bytes());
+    order_raw[12..16].copy_from_slice(&100u32.to_le_bytes());
+    order_raw[24..28].copy_from_slice(&order_position.to_le_bytes());
+
+    let mhod = MhodChunk {
+        mhod_type: 100,
+        raw_bytes: order_raw,
+    };
+    let header_len = 76u32;
+    let total_len = header_len + mhod.raw_bytes.len() as u32;
+    let mut header_bytes = vec![0u8; header_len as usize];
+    header_bytes[0..4].copy_from_slice(b"mhip");
+    header_bytes[4..8].copy_from_slice(&header_len.to_le_bytes());
+    header_bytes[8..12].copy_from_slice(&total_len.to_le_bytes());
+    header_bytes[12..16].copy_from_slice(&1u32.to_le_bytes());
+    header_bytes[24..28].copy_from_slice(&track_id.to_le_bytes());
+
+    MhipChunk {
+        header_bytes,
+        mhods: vec![mhod],
+        track_id,
+        order_position: Some(order_position),
+        is_podcast_group: false,
     }
 }
 

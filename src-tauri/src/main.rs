@@ -2,7 +2,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use podloader_core::DeviceConnectionState;
+use podloader_core::{DeviceConnectionState, DuplicateResolution, InterruptedResolution};
 use podloader_shell::AppState;
 
 fn main() {
@@ -114,14 +114,64 @@ fn run_dev_bridge_server(state: &AppState) {
     }
 }
 
+fn read_http_request(stream: &mut std::net::TcpStream) -> std::io::Result<(String, String)> {
+    let mut data = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    let mut header_end: Option<usize> = None;
+    let mut content_length: usize = 0;
+
+    loop {
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        data.extend_from_slice(&chunk[..n]);
+
+        if header_end.is_none() {
+            if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                let end = pos + 4;
+                header_end = Some(end);
+                let headers_str = String::from_utf8_lossy(&data[..pos]);
+                for line in headers_str.lines() {
+                    if let Some((k, v)) = line.split_once(':') {
+                        if k.trim().eq_ignore_ascii_case("content-length") {
+                            content_length = v.trim().parse::<usize>().unwrap_or(0);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(end) = header_end {
+            if data.len() >= end + content_length {
+                break;
+            }
+        }
+    }
+
+    let Some(end) = header_end else {
+        let text = String::from_utf8_lossy(&data);
+        let first = text.lines().next().unwrap_or("").to_string();
+        return Ok((first, "{}".to_string()));
+    };
+
+    let headers_str = String::from_utf8_lossy(&data[..end - 4]);
+    let first_line = headers_str.lines().next().unwrap_or("").to_string();
+    let body_slice = data.get(end..end + content_length).unwrap_or(&data[end..]);
+    let body = if body_slice.is_empty() {
+        "{}".to_string()
+    } else {
+        String::from_utf8_lossy(body_slice).to_string()
+    };
+    Ok((first_line, body))
+}
+
 fn handle_http_client(mut stream: std::net::TcpStream, state: &AppState) -> std::io::Result<()> {
-    let mut buf = [0u8; 8192];
-    let n = stream.read(&mut buf)?;
-    if n == 0 {
+    let (first_line, body) = read_http_request(&mut stream)?;
+    if first_line.is_empty() {
         return Ok(());
     }
-    let req = String::from_utf8_lossy(&buf[..n]);
-    let first_line = req.lines().next().unwrap_or("");
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
 
     let response_json = if first_line.starts_with("GET /api/scan_device") {
         match state.scan_device() {
@@ -129,11 +179,60 @@ fn handle_http_client(mut stream: std::net::TcpStream, state: &AppState) -> std:
             Err(e) => serde_json::json!({ "error": e }).to_string(),
         }
     } else if first_line.starts_with("POST /api/initialize_device") {
-        let body = req.split("\r\n\r\n").nth(1).unwrap_or("{}");
-        let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
         let mount_path = parsed["mountPath"].as_str().unwrap_or("");
         let device_name = parsed["deviceName"].as_str().unwrap_or("My iPod");
         match state.initialize_device(mount_path, device_name) {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("POST /api/browse_host_directory") {
+        let dir_path = parsed["dirPath"].as_str().unwrap_or(".");
+        match state.browse_host_directory(dir_path) {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("POST /api/stage_host_paths") {
+        let paths: Vec<String> = parsed["paths"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let target_playlist_id = parsed["targetPlaylistId"].as_u64();
+        match state.stage_host_paths(paths, target_playlist_id) {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("POST /api/set_duplicate_resolution") {
+        let staged_id = parsed["stagedId"].as_u64().unwrap_or(0);
+        let resolution: DuplicateResolution =
+            serde_json::from_value(parsed["resolution"].clone())
+                .unwrap_or(DuplicateResolution::Skip);
+        match state.set_duplicate_resolution(staged_id, resolution) {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("POST /api/commit_sync_batch") {
+        let limit = parsed["maxTracksBeforeInterrupt"]
+            .as_u64()
+            .map(|n| n as usize);
+        match state.commit_sync_batch(limit) {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("POST /api/resolve_interrupted_batch") {
+        let resolution: InterruptedResolution =
+            serde_json::from_value(parsed["resolution"].clone())
+                .unwrap_or(InterruptedResolution::RollBack);
+        match state.resolve_interrupted_batch(resolution) {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("POST /api/set_manual_firewire_guid") {
+        let guid = parsed["guid"].as_str().unwrap_or("");
+        match state.set_manual_firewire_guid(guid) {
             Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
             Err(e) => serde_json::json!({ "error": e }).to_string(),
         }

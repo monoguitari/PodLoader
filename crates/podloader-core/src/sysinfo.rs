@@ -36,10 +36,12 @@ pub fn cache_guid_in_sysinfo(sysinfo_path: &Path, guid: &str) -> std::io::Result
         fs::create_dir_all(parent)?;
     }
     let normalized = normalize_firewire_guid(guid);
-    let mut existing = fs::read_to_string(sysinfo_path).unwrap_or_default();
-    if !existing.is_empty() && !existing.ends_with('\n') {
-        existing.push('\n');
-    }
-    existing.push_str(&format!("FireWireGuid: 0x{}\n", normalized));
-    fs::write(sysinfo_path, existing)
+    let existing = fs::read_to_string(sysinfo_path).unwrap_or_default();
+    let mut lines: Vec<String> = existing
+        .lines()
+        .filter(|l| !l.trim().starts_with("FireWireGuid:"))
+        .map(|l| l.to_string())
+        .collect();
+    lines.push(format!("FireWireGuid: 0x{}", normalized));
+    fs::write(sysinfo_path, format!("{}\n", lines.join("\n")))
 }

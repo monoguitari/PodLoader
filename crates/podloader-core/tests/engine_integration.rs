@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 
 use podloader_core::{
-    DeviceConnectionState, HardwareDeviceAdapter, MountedVolume, PlaylistKind, PodLoaderEngine,
+    verify_itunesdb_signatures, CommitOutcome, DeviceConnectionState, DuplicateResolution,
+    HardwareDeviceAdapter, InterruptedResolution, MountedVolume, PlaylistKind, PodLoaderEngine,
     PodLoaderError,
 };
 
@@ -586,5 +587,748 @@ fn merges_play_counts_file_into_loaded_device_tracks() {
         other => panic!("expected Connected, got {:?}", other),
     }
 }
+
+fn build_id3v23_mp3_fixture(
+    title: &str,
+    artist: &str,
+    album: &str,
+    track_number: u32,
+    genre: &str,
+    year: u32,
+    duration_seconds: u32,
+) -> Vec<u8> {
+    fn encode_text_frame(frame_id: &[u8; 4], text: &str) -> Vec<u8> {
+        let payload_len = 1 + text.len() as u32; // encoding byte 0 (ISO-8859-1/UTF-8) + text
+        let mut frame = Vec::with_capacity(10 + payload_len as usize);
+        frame.extend_from_slice(frame_id);
+        frame.extend_from_slice(&payload_len.to_be_bytes());
+        frame.extend_from_slice(&[0, 0]); // flags
+        frame.push(3); // UTF-8 text encoding
+        frame.extend_from_slice(text.as_bytes());
+        frame
+    }
+
+    let mut frames = Vec::new();
+    frames.extend_from_slice(&encode_text_frame(b"TIT2", title));
+    frames.extend_from_slice(&encode_text_frame(b"TPE1", artist));
+    frames.extend_from_slice(&encode_text_frame(b"TALB", album));
+    frames.extend_from_slice(&encode_text_frame(b"TRCK", &track_number.to_string()));
+    frames.extend_from_slice(&encode_text_frame(b"TCON", genre));
+    frames.extend_from_slice(&encode_text_frame(b"TYER", &year.to_string()));
+
+    let size = frames.len() as u32;
+    let synchsafe = [
+        ((size >> 21) & 0x7F) as u8,
+        ((size >> 14) & 0x7F) as u8,
+        ((size >> 7) & 0x7F) as u8,
+        (size & 0x7F) as u8,
+    ];
+
+    let mut mp3 = Vec::new();
+    mp3.extend_from_slice(b"ID3");
+    mp3.extend_from_slice(&[3, 0, 0]); // v2.3.0, no flags
+    mp3.extend_from_slice(&synchsafe);
+    mp3.extend_from_slice(&frames);
+
+    // Append synthetic 128 kbps CBR MP3 payload (16_000 bytes per second)
+    let audio_bytes = (duration_seconds as usize) * 16_000;
+    let mut audio = vec![0u8; audio_bytes.max(4)];
+    // MPEG-1 Layer III 128kbps 44.1kHz frame sync header: 0xFF 0xFB 0x90 0x00
+    audio[0] = 0xFF;
+    audio[1] = 0xFB;
+    audio[2] = 0x90;
+    audio[3] = 0x00;
+    mp3.extend_from_slice(&audio);
+    mp3
+}
+
+fn build_wav_fixture(sample_rate: u32, duration_seconds: u32) -> Vec<u8> {
+    let channels: u16 = 2;
+    let bits_per_sample: u16 = 16;
+    let byte_rate = sample_rate * (channels as u32) * (bits_per_sample as u32 / 8);
+    let block_align = channels * (bits_per_sample / 8);
+    let data_len = byte_rate * duration_seconds;
+    let riff_len = 36 + data_len;
+
+    let mut wav = Vec::with_capacity((44 + data_len) as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&riff_len.to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&channels.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&block_align.to_le_bytes());
+    wav.extend_from_slice(&bits_per_sample.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.resize((44 + data_len) as usize, 0);
+    wav
+}
+
+fn build_m4a_alac_fixture(
+    title: &str,
+    artist: &str,
+    album: &str,
+    track_number: u16,
+    duration_seconds: u32,
+) -> Vec<u8> {
+    fn encode_ilst_text_atom(atom_id: &[u8; 4], text: &str) -> Vec<u8> {
+        let data_len = 16 + text.len() as u32;
+        let atom_len = 8 + data_len;
+        let mut out = Vec::with_capacity(atom_len as usize);
+        out.extend_from_slice(&atom_len.to_be_bytes());
+        out.extend_from_slice(atom_id);
+        out.extend_from_slice(&data_len.to_be_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&1u32.to_be_bytes()); // UTF-8 type indicator
+        out.extend_from_slice(&0u32.to_be_bytes()); // locale
+        out.extend_from_slice(text.as_bytes());
+        out
+    }
+
+    fn encode_trkn_atom(track_number: u16) -> Vec<u8> {
+        let payload = [
+            0u8,
+            0,
+            (track_number >> 8) as u8,
+            (track_number & 0xFF) as u8,
+            0,
+            10,
+            0,
+            0,
+        ];
+        let data_len = 16 + payload.len() as u32;
+        let atom_len = 8 + data_len;
+        let mut out = Vec::with_capacity(atom_len as usize);
+        out.extend_from_slice(&atom_len.to_be_bytes());
+        out.extend_from_slice(b"trkn");
+        out.extend_from_slice(&data_len.to_be_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    let mut m4a = Vec::new();
+    // ftyp + alac codec marker
+    m4a.extend_from_slice(&20u32.to_be_bytes());
+    m4a.extend_from_slice(b"ftypM4A \x00\x00\x00\x00alac");
+
+    // mvhd atom (version 0: 4 bytes version/flags + 8 bytes times + 4 bytes timescale + 4 bytes duration)
+    let timescale = 44_100u32;
+    let duration = timescale * duration_seconds;
+    m4a.extend_from_slice(&36u32.to_be_bytes());
+    m4a.extend_from_slice(b"mvhd");
+    m4a.extend_from_slice(&[0u8; 12]); // version 0 + flags + creation/mod time
+    m4a.extend_from_slice(&timescale.to_be_bytes());
+    m4a.extend_from_slice(&duration.to_be_bytes());
+    m4a.extend_from_slice(&[0u8; 8]);
+
+    // ilst atoms
+    m4a.extend_from_slice(&encode_ilst_text_atom(b"\xA9nam", title));
+    m4a.extend_from_slice(&encode_ilst_text_atom(b"\xA9ART", artist));
+    m4a.extend_from_slice(&encode_ilst_text_atom(b"\xA9alb", album));
+    m4a.extend_from_slice(&encode_trkn_atom(track_number));
+    m4a
+}
+
+#[test]
+fn browses_host_directory_statelessly_and_extracts_audio_tags() {
+    let host_temp = TempDir::new().expect("create host temp dir");
+    let host_root = host_temp.path();
+
+    fs::create_dir_all(host_root.join("Albums")).expect("create subfolder");
+    fs::write(host_root.join("notes.txt"), "ignore non-audio files").expect("write txt");
+
+    let mp3_bytes = build_id3v23_mp3_fixture(
+        "Let Down",
+        "Radiohead",
+        "OK Computer",
+        5,
+        "Alternative",
+        1997,
+        10,
+    );
+    fs::write(host_root.join("05 - Let Down.mp3"), &mp3_bytes).expect("write mp3 fixture");
+
+    let wav_bytes = build_wav_fixture(44_100, 2);
+    fs::write(host_root.join("01 - Intro Jam.wav"), &wav_bytes).expect("write wav fixture");
+
+    let alac_bytes = build_m4a_alac_fixture("Exit Music (For a Film)", "Radiohead", "OK Computer", 4, 8);
+    fs::write(host_root.join("04 - Exit Music.m4a"), &alac_bytes).expect("write m4a fixture");
+
+    let adapter = FakeHardwareAdapter { volumes: vec![] };
+    let engine = PodLoaderEngine::new(adapter);
+
+    let listing = engine
+        .browse_host_directory(host_root)
+        .expect("browse host directory");
+
+    assert_eq!(listing.current_path, host_root);
+    assert_eq!(listing.subdirectories.len(), 1);
+    assert_eq!(listing.subdirectories[0].name, "Albums");
+
+    assert_eq!(listing.files.len(), 3);
+
+    // Track 1: WAV file (fallback to filename parsing for track # and title, accurate WAV duration & bitrate)
+    let f1 = &listing.files[0];
+    assert_eq!(f1.file_name, "01 - Intro Jam.wav");
+    assert_eq!(f1.format, "WAV");
+    assert_eq!(f1.track_number, 1);
+    assert_eq!(f1.title, "Intro Jam");
+    assert_eq!(f1.duration_ms, 2_000);
+    assert_eq!(f1.bitrate_kbps, 1411);
+
+    // Track 4: ALAC M4A file with MP4 mvhd + ilst metadata atoms
+    let f2 = &listing.files[1];
+    assert_eq!(f2.file_name, "04 - Exit Music.m4a");
+    assert_eq!(f2.format, "ALAC");
+    assert_eq!(f2.title, "Exit Music (For a Film)");
+    assert_eq!(f2.artist, "Radiohead");
+    assert_eq!(f2.album, "OK Computer");
+    assert_eq!(f2.track_number, 4);
+    assert_eq!(f2.duration_ms, 8_000);
+
+    // Track 5: MP3 file with ID3v2.3 tags
+    let f3 = &listing.files[2];
+    assert_eq!(f3.file_name, "05 - Let Down.mp3");
+    assert_eq!(f3.format, "MP3");
+    assert_eq!(f3.title, "Let Down");
+    assert_eq!(f3.artist, "Radiohead");
+    assert_eq!(f3.album, "OK Computer");
+    assert_eq!(f3.track_number, 5);
+    assert_eq!(f3.genre, "Alternative");
+    assert_eq!(f3.year, 1997);
+    assert_eq!(f3.duration_ms, 10_000);
+    assert_eq!(f3.bitrate_kbps, 128);
+}
+
+#[test]
+fn stages_host_files_detects_duplicates_and_rejects_commit_when_free_space_insufficient() {
+    let device_temp = TempDir::new().expect("create device temp dir");
+    let mount_path = device_temp.path().to_path_buf();
+    let itunes_dir = mount_path.join("iPod_Control").join("iTunes");
+    fs::create_dir_all(&itunes_dir).expect("create iTunes dir");
+
+    // Existing Device Track: Radiohead - OK Computer - #2 Paranoid Android
+    let existing_track = build_mhit_fixture(
+        101,
+        "Paranoid Android",
+        "Radiohead",
+        "OK Computer",
+        "Alternative",
+        ":iPod_Control:Music:F04:ABCD.m4a",
+        2,
+        1,
+        1997,
+        383_000,
+        945,
+        12,
+        5,
+        vec![],
+    );
+    let mut mhlt = vec![0u8; 92];
+    mhlt[0..4].copy_from_slice(b"mhlt");
+    mhlt[4..8].copy_from_slice(&92u32.to_le_bytes());
+    mhlt[8..12].copy_from_slice(&1u32.to_le_bytes());
+    mhlt.extend_from_slice(&existing_track);
+
+    let mut mhsd_tracks = vec![0u8; 96];
+    mhsd_tracks[0..4].copy_from_slice(b"mhsd");
+    mhsd_tracks[4..8].copy_from_slice(&96u32.to_le_bytes());
+    mhsd_tracks[8..12].copy_from_slice(&((96 + mhlt.len()) as u32).to_le_bytes());
+    mhsd_tracks[12..16].copy_from_slice(&1u32.to_le_bytes());
+    mhsd_tracks.extend_from_slice(&mhlt);
+
+    let master_pl = build_mhyp_fixture(1, "My iPod", true, vec![], &[101]);
+    let mut mhlp = vec![0u8; 92];
+    mhlp[0..4].copy_from_slice(b"mhlp");
+    mhlp[4..8].copy_from_slice(&92u32.to_le_bytes());
+    mhlp[8..12].copy_from_slice(&1u32.to_le_bytes());
+    mhlp.extend_from_slice(&master_pl);
+
+    let mut mhsd_playlists = vec![0u8; 96];
+    mhsd_playlists[0..4].copy_from_slice(b"mhsd");
+    mhsd_playlists[4..8].copy_from_slice(&96u32.to_le_bytes());
+    mhsd_playlists[8..12].copy_from_slice(&((96 + mhlp.len()) as u32).to_le_bytes());
+    mhsd_playlists[12..16].copy_from_slice(&2u32.to_le_bytes());
+    mhsd_playlists.extend_from_slice(&mhlp);
+
+    let mhbd_header_len = 104u32;
+    let total_len = mhbd_header_len + (mhsd_tracks.len() + mhsd_playlists.len()) as u32;
+    let mut db_bytes = vec![0u8; mhbd_header_len as usize];
+    db_bytes[0..4].copy_from_slice(b"mhbd");
+    db_bytes[4..8].copy_from_slice(&mhbd_header_len.to_le_bytes());
+    db_bytes[8..12].copy_from_slice(&total_len.to_le_bytes());
+    db_bytes[12..16].copy_from_slice(&1u32.to_le_bytes());
+    db_bytes[16..20].copy_from_slice(&0x19u32.to_le_bytes());
+    db_bytes[20..24].copy_from_slice(&2u32.to_le_bytes());
+    db_bytes.extend_from_slice(&mhsd_tracks);
+    db_bytes.extend_from_slice(&mhsd_playlists);
+    fs::write(itunes_dir.join("iTunesDB"), &db_bytes).expect("write iTunesDB");
+
+    // Host files: one duplicate (normalized case/whitespace match) and one brand-new track
+    let host_temp = TempDir::new().expect("create host temp dir");
+    let dup_mp3 = build_id3v23_mp3_fixture(
+        "  paranoid android ",
+        "RADIOHEAD",
+        "ok computer",
+        2,
+        "Alternative",
+        1997,
+        5,
+    );
+    let new_mp3 = build_id3v23_mp3_fixture(
+        "Karma Police",
+        "Radiohead",
+        "OK Computer",
+        6,
+        "Alternative",
+        1997,
+        5,
+    );
+    let dup_path = host_temp.path().join("02 - Paranoid Android.mp3");
+    let new_path = host_temp.path().join("06 - Karma Police.mp3");
+    fs::write(&dup_path, &dup_mp3).expect("write dup mp3");
+    fs::write(&new_path, &new_mp3).expect("write new mp3");
+
+    // Simulate tight free space: enough for 1 track (100 KB), NOT enough for 2 tracks (~160 KB)
+    let adapter = FakeHardwareAdapter {
+        volumes: vec![MountedVolume {
+            mount_path: mount_path.clone(),
+            volume_name: "IPOD".to_string(),
+            total_bytes: 30_000_000_000,
+            free_bytes: 100_000,
+            usb_firewire_guid: None,
+        }],
+    };
+
+    let mut engine = PodLoaderEngine::new(adapter);
+    engine.scan_device().expect("initial scan");
+
+    // Stage the entire host directory
+    let batch = engine
+        .stage_host_paths(&[host_temp.path().to_path_buf()], None)
+        .expect("stage host folder");
+
+    assert_eq!(batch.additions.len(), 2);
+    let staged_dup = &batch.additions[0];
+    assert!(staged_dup.is_duplicate);
+    assert_eq!(staged_dup.matched_device_track_id, Some(101));
+    assert_eq!(staged_dup.duplicate_resolution, DuplicateResolution::Skip);
+
+    let staged_new = &batch.additions[1];
+    assert!(!staged_new.is_duplicate);
+    assert_eq!(staged_new.matched_device_track_id, None);
+    assert_eq!(
+        staged_new.duplicate_resolution,
+        DuplicateResolution::ImportAnyway
+    );
+
+    // Because duplicate defaults to Skip, required_bytes only counts the new track (~80 KB <= 100 KB)
+    assert_eq!(batch.required_bytes, new_mp3.len() as u64);
+
+    // Override duplicate to ImportAnyway -> now required_bytes = dup + new (~160 KB > 100 KB free!)
+    let updated_batch = engine
+        .set_duplicate_resolution(staged_dup.staged_id, DuplicateResolution::ImportAnyway)
+        .expect("override duplicate resolution");
+    assert_eq!(
+        updated_batch.required_bytes,
+        (dup_mp3.len() + new_mp3.len()) as u64
+    );
+
+    // Commit must fail pre-flight space check without writing any audio files
+    let err = engine
+        .commit_sync_batch()
+        .expect_err("expected InsufficientDiskSpace error");
+    match err {
+        PodLoaderError::InsufficientDiskSpace {
+            required_bytes,
+            available_bytes,
+        } => {
+            assert_eq!(required_bytes, (dup_mp3.len() + new_mp3.len()) as u64);
+            assert_eq!(available_bytes, 100_000);
+        }
+        other => panic!("expected InsufficientDiskSpace, got {:?}", other),
+    }
+}
+
+#[test]
+fn commits_sync_batch_atomically_allocates_obfuscated_paths_creates_backup_deletes_play_counts_and_signs_hashes()
+ {
+    let device_temp = TempDir::new().expect("create device temp dir");
+    let mount_path = device_temp.path().to_path_buf();
+    let ipod_control = mount_path.join("iPod_Control");
+    let music_dir = ipod_control.join("Music");
+    for idx in 0..50 {
+        fs::create_dir_all(music_dir.join(format!("F{:02}", idx))).expect("create Fxx");
+    }
+    let itunes_dir = ipod_control.join("iTunes");
+    let device_dir = ipod_control.join("Device");
+    fs::create_dir_all(&itunes_dir).expect("create iTunes dir");
+    fs::create_dir_all(&device_dir).expect("create Device dir");
+
+    // Write old file for track 101 so we can verify ReplaceExisting cleans it up
+    let old_track_file = music_dir.join("F04").join("ABCD.m4a");
+    fs::write(&old_track_file, b"old-audio-bytes").expect("write old track file");
+
+    let track101 = build_mhit_fixture(
+        101,
+        "Paranoid Android",
+        "Radiohead",
+        "OK Computer",
+        "Alternative",
+        ":iPod_Control:Music:F04:ABCD.m4a",
+        2,
+        1,
+        1997,
+        383_000,
+        945,
+        3,
+        4,
+        vec![build_raw_mhod_fixture(99, &[0xDE, 0xAD, 0xBE, 0xEF])],
+    );
+    let mut mhlt = vec![0u8; 92];
+    mhlt[0..4].copy_from_slice(b"mhlt");
+    mhlt[4..8].copy_from_slice(&92u32.to_le_bytes());
+    mhlt[8..12].copy_from_slice(&1u32.to_le_bytes());
+    mhlt.extend_from_slice(&track101);
+
+    let mut mhsd_tracks = vec![0u8; 96];
+    mhsd_tracks[0..4].copy_from_slice(b"mhsd");
+    mhsd_tracks[4..8].copy_from_slice(&96u32.to_le_bytes());
+    mhsd_tracks[8..12].copy_from_slice(&((96 + mhlt.len()) as u32).to_le_bytes());
+    mhsd_tracks[12..16].copy_from_slice(&1u32.to_le_bytes());
+    mhsd_tracks.extend_from_slice(&mhlt);
+
+    let master_pl = build_mhyp_fixture(1000, "Classic 160GB", true, vec![], &[101]);
+    let user_pl = build_mhyp_fixture(2000, "Road Trip", false, vec![], &[]);
+    let smart_pl = build_mhyp_fixture(
+        3000,
+        "Top Rated",
+        false,
+        vec![
+            build_raw_mhod_fixture(50, &[1, 2, 3, 4]),
+            build_raw_mhod_fixture(51, &[5, 6, 7, 8]),
+        ],
+        &[101],
+    );
+    let mut mhlp = vec![0u8; 92];
+    mhlp[0..4].copy_from_slice(b"mhlp");
+    mhlp[4..8].copy_from_slice(&92u32.to_le_bytes());
+    mhlp[8..12].copy_from_slice(&3u32.to_le_bytes());
+    mhlp.extend_from_slice(&master_pl);
+    mhlp.extend_from_slice(&user_pl);
+    mhlp.extend_from_slice(&smart_pl);
+
+    let mut mhsd_playlists = vec![0u8; 96];
+    mhsd_playlists[0..4].copy_from_slice(b"mhsd");
+    mhsd_playlists[4..8].copy_from_slice(&96u32.to_le_bytes());
+    mhsd_playlists[8..12].copy_from_slice(&((96 + mhlp.len()) as u32).to_le_bytes());
+    mhsd_playlists[12..16].copy_from_slice(&2u32.to_le_bytes());
+    mhsd_playlists.extend_from_slice(&mhlp);
+
+    let mut mhsd_extra = vec![0u8; 96];
+    mhsd_extra[0..4].copy_from_slice(b"mhsd");
+    mhsd_extra[4..8].copy_from_slice(&96u32.to_le_bytes());
+    mhsd_extra[8..12].copy_from_slice(&100u32.to_le_bytes());
+    mhsd_extra[12..16].copy_from_slice(&4u32.to_le_bytes());
+    mhsd_extra.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]);
+
+    let mhbd_header_len = 244u32;
+    let total_len =
+        mhbd_header_len + (mhsd_tracks.len() + mhsd_playlists.len() + mhsd_extra.len()) as u32;
+    let mut initial_db = vec![0u8; mhbd_header_len as usize];
+    initial_db[0..4].copy_from_slice(b"mhbd");
+    initial_db[4..8].copy_from_slice(&mhbd_header_len.to_le_bytes());
+    initial_db[8..12].copy_from_slice(&total_len.to_le_bytes());
+    initial_db[12..16].copy_from_slice(&1u32.to_le_bytes());
+    initial_db[16..20].copy_from_slice(&0x19u32.to_le_bytes());
+    initial_db[20..24].copy_from_slice(&3u32.to_le_bytes());
+    initial_db.extend_from_slice(&mhsd_tracks);
+    initial_db.extend_from_slice(&mhsd_playlists);
+    initial_db.extend_from_slice(&mhsd_extra);
+    fs::write(itunes_dir.join("iTunesDB"), &initial_db).expect("write initial iTunesDB");
+
+    // Pending Play Counts file (+2 plays for track 101)
+    let mut play_counts = vec![0u8; 96];
+    play_counts[0..4].copy_from_slice(b"mhdp");
+    play_counts[4..8].copy_from_slice(&96u32.to_le_bytes());
+    play_counts[8..12].copy_from_slice(&28u32.to_le_bytes());
+    play_counts[12..16].copy_from_slice(&1u32.to_le_bytes());
+    let mut pc_entry = vec![0u8; 28];
+    pc_entry[0..4].copy_from_slice(&2u32.to_le_bytes());
+    play_counts.extend_from_slice(&pc_entry);
+    let play_counts_path = itunes_dir.join("Play Counts");
+    fs::write(&play_counts_path, &play_counts).expect("write Play Counts");
+
+    // Host files to stage
+    let host_temp = TempDir::new().expect("create host temp");
+    let replacement_mp3 = build_id3v23_mp3_fixture(
+        "Paranoid Android",
+        "Radiohead",
+        "OK Computer",
+        2,
+        "Alternative",
+        1997,
+        6,
+    );
+    let karma_mp3 = build_id3v23_mp3_fixture(
+        "Karma Police",
+        "Radiohead",
+        "OK Computer",
+        6,
+        "Alternative",
+        1997,
+        4,
+    );
+    let rep_path = host_temp.path().join("02 - Paranoid Android.mp3");
+    let karma_path = host_temp.path().join("06 - Karma Police.mp3");
+    fs::write(&rep_path, &replacement_mp3).expect("write replacement mp3");
+    fs::write(&karma_path, &karma_mp3).expect("write karma mp3");
+
+    let adapter = FakeHardwareAdapter {
+        volumes: vec![MountedVolume {
+            mount_path: mount_path.clone(),
+            volume_name: "IPOD".to_string(),
+            total_bytes: 160_000_000_000,
+            free_bytes: 120_000_000_000,
+            usb_firewire_guid: None,
+        }],
+    };
+    let mut engine = PodLoaderEngine::new(adapter);
+    engine.scan_device().expect("initial scan");
+
+    // Set manual FireWire GUID (persists to SysInfo)
+    let updated_session = engine
+        .set_manual_firewire_guid("000A270011223344")
+        .expect("set manual FireWire GUID");
+    assert_eq!(
+        updated_session.device.firewire_guid.as_deref(),
+        Some("000A270011223344")
+    );
+
+    // Stage both host files targeting user playlist "Road Trip" (id 2000)
+    let batch = engine
+        .stage_host_paths(&[rep_path, karma_path], Some(2000))
+        .expect("stage host paths");
+    assert_eq!(batch.additions.len(), 2);
+    let dup_staged_id = batch
+        .additions
+        .iter()
+        .find(|a| a.is_duplicate)
+        .expect("find dup")
+        .staged_id;
+
+    // Set duplicate resolution to ReplaceExisting
+    engine
+        .set_duplicate_resolution(dup_staged_id, DuplicateResolution::ReplaceExisting)
+        .expect("set ReplaceExisting");
+
+    // Commit Sync Batch
+    let outcome = engine.commit_sync_batch().expect("commit sync batch");
+    let committed_session = match outcome {
+        CommitOutcome::Completed(s) => s,
+        other => panic!("expected Completed, got {:?}", other),
+    };
+
+    // 1. Sync Batch is cleared after commit
+    assert!(committed_session.sync_batch.additions.is_empty());
+
+    // 2. iTunesDB.bak matches original database bytes, and Play Counts file is removed
+    let bak_bytes = fs::read(itunes_dir.join("iTunesDB.bak")).expect("read iTunesDB.bak");
+    assert_eq!(bak_bytes, initial_db);
+    assert!(
+        !play_counts_path.exists(),
+        "expected consumed Play Counts file to be deleted on commit"
+    );
+
+    // 3. Old replaced file is deleted, and both tracks have valid 4-char Obfuscated Paths on disk
+    assert!(
+        !old_track_file.exists(),
+        "expected replaced track's old Obfuscated Path file to be deleted"
+    );
+    assert_eq!(committed_session.library.tracks.len(), 2);
+    for track in &committed_session.library.tracks {
+        assert!(track.obfuscated_path.starts_with(":iPod_Control:Music:F"));
+        let rel_path = track
+            .obfuscated_path
+            .trim_start_matches(':')
+            .replace(':', "/");
+        let full_disk_path = mount_path.join(&rel_path);
+        assert!(
+            full_disk_path.is_file(),
+            "expected audio file at {:?} to exist on disk",
+            full_disk_path
+        );
+        let stem = full_disk_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("stem");
+        assert_eq!(
+            stem.len(),
+            4,
+            "expected 4-letter Obfuscated Path filename, got {}",
+            stem
+        );
+    }
+
+    // Merged play count (3 + 2 = 5) on replaced track 101 is preserved!
+    let t101 = committed_session
+        .library
+        .tracks
+        .iter()
+        .find(|t| t.id == 101)
+        .expect("track 101");
+    assert_eq!(t101.play_count, 5);
+
+    // 4. Both tracks are registered in Master Playlist (1000) and target Device Playlist "Road Trip" (2000)
+    let master = committed_session
+        .library
+        .playlists
+        .iter()
+        .find(|p| p.id == 1000)
+        .expect("master playlist");
+    assert_eq!(master.track_ids.len(), 2);
+
+    let road_trip = committed_session
+        .library
+        .playlists
+        .iter()
+        .find(|p| p.id == 2000)
+        .expect("road trip playlist");
+    assert_eq!(road_trip.track_ids.len(), 2);
+
+    // 5. Smart Playlist "Top Rated" (3000) is preserved
+    let smart = committed_session
+        .library
+        .playlists
+        .iter()
+        .find(|p| p.id == 3000)
+        .expect("smart playlist");
+    assert_eq!(smart.kind, PlaylistKind::Smart);
+
+    // 6. Verify hash58 & hash72 signatures on the written iTunesDB
+    let committed_db_bytes = fs::read(itunes_dir.join("iTunesDB")).expect("read committed iTunesDB");
+    assert!(
+        verify_itunesdb_signatures(&committed_db_bytes, "000A270011223344"),
+        "expected valid hash58 and hash72 signatures on committed iTunesDB"
+    );
+    assert!(
+        !verify_itunesdb_signatures(&committed_db_bytes, "000A270099999999"),
+        "signature verification must fail against a different FireWire GUID"
+    );
+}
+
+#[test]
+fn recovers_from_mid_batch_interruption_with_rollback_or_commit_completed_tracks() {
+    let device_temp = TempDir::new().expect("create device temp dir");
+    let mount_path = device_temp.path().to_path_buf();
+    let adapter = FakeHardwareAdapter {
+        volumes: vec![MountedVolume {
+            mount_path: mount_path.clone(),
+            volume_name: "IPOD".to_string(),
+            total_bytes: 30_000_000_000,
+            free_bytes: 25_000_000_000,
+            usb_firewire_guid: Some("000A270055667788".to_string()),
+        }],
+    };
+    let mut engine = PodLoaderEngine::new(adapter);
+    engine
+        .initialize_device(&mount_path, "Classic")
+        .expect("init device");
+
+    let host_temp = TempDir::new().expect("create host temp");
+    let t1_path = host_temp.path().join("01 - First Track.mp3");
+    let t2_path = host_temp.path().join("02 - Second Track.mp3");
+    fs::write(
+        &t1_path,
+        build_id3v23_mp3_fixture("First Track", "Artist A", "Album A", 1, "Rock", 2001, 3),
+    )
+    .expect("write t1");
+    fs::write(
+        &t2_path,
+        build_id3v23_mp3_fixture("Second Track", "Artist A", "Album A", 2, "Rock", 2001, 3),
+    )
+    .expect("write t2");
+
+    engine
+        .stage_host_paths(&[t1_path, t2_path], None)
+        .expect("stage 2 tracks");
+
+    // 1. Interrupt after copying 1 track -> Roll Back Batch
+    let outcome1 = engine
+        .commit_sync_batch_with_limit(Some(1))
+        .expect("interrupt after 1 track");
+    let first_written_disk_path = match outcome1 {
+        CommitOutcome::Interrupted(summary) => {
+            assert_eq!(summary.completed_track_count, 1);
+            assert_eq!(summary.remaining_track_count, 1);
+            assert_eq!(summary.written_obfuscated_paths.len(), 1);
+            let rel = summary.written_obfuscated_paths[0]
+                .trim_start_matches(':')
+                .replace(':', "/");
+            let disk_p = mount_path.join(rel);
+            assert!(
+                disk_p.is_file(),
+                "expected copied file to exist before rollback"
+            );
+            disk_p
+        }
+        other => panic!("expected Interrupted, got {:?}", other),
+    };
+
+    let rolled_back = engine
+        .resolve_interrupted_batch(InterruptedResolution::RollBack)
+        .expect("roll back batch");
+    assert!(
+        !first_written_disk_path.exists(),
+        "expected RollBack to delete newly copied Obfuscated Path file"
+    );
+    assert!(
+        rolled_back.library.tracks.is_empty(),
+        "expected iTunesDB to remain untouched on RollBack"
+    );
+    assert_eq!(
+        rolled_back.sync_batch.additions.len(),
+        2,
+        "expected both staged items to remain in SyncBatch after RollBack"
+    );
+
+    // 2. Interrupt after copying 1 track -> Commit Completed Tracks
+    let outcome2 = engine
+        .commit_sync_batch_with_limit(Some(1))
+        .expect("interrupt again after 1 track");
+    match outcome2 {
+        CommitOutcome::Interrupted(summary) => {
+            assert_eq!(summary.completed_track_count, 1);
+            assert_eq!(summary.remaining_track_count, 1);
+        }
+        other => panic!("expected Interrupted, got {:?}", other),
+    }
+
+    let partial_committed = engine
+        .resolve_interrupted_batch(InterruptedResolution::CommitCompleted)
+        .expect("commit completed tracks");
+    assert_eq!(partial_committed.library.tracks.len(), 1);
+    assert_eq!(partial_committed.library.tracks[0].title, "First Track");
+    assert_eq!(
+        partial_committed.sync_batch.additions.len(),
+        1,
+        "expected remaining 1 track to stay in SyncBatch"
+    );
+    assert_eq!(
+        partial_committed.sync_batch.additions[0].host_file.title,
+        "Second Track"
+    );
+}
+
+
+
+
 
 

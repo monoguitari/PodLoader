@@ -1,16 +1,23 @@
 //! Core domain engine for PodLoader (`ADR-0001`, `ADR-0004`, `ADR-0006`).
 
+pub mod host;
 pub mod itunesdb;
 pub mod playcounts;
+pub mod signing;
 pub mod sysinfo;
 
+use std::cell::RefCell;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::host::{collect_host_files_from_paths, is_native_ipod_format};
 use crate::itunesdb::{build_empty_itunesdb, ItunesDb};
 use crate::playcounts::{merge_play_counts_into_tracks, parse_play_counts};
+pub use crate::signing::verify_itunesdb_signatures;
+use crate::signing::{parse_firewire_guid_bytes, sign_itunesdb};
 use crate::sysinfo::{cache_guid_in_sysinfo, normalize_firewire_guid, parse_sysinfo};
 
 #[derive(Debug, Error)]
@@ -23,6 +30,53 @@ pub enum PodLoaderError {
     InvalidPlayCounts(String),
     #[error("Volume not found at {0}")]
     VolumeNotFound(PathBuf),
+    #[error("Directory not found at {0}")]
+    DirectoryNotFound(PathBuf),
+    #[error("Insufficient disk space: required {required_bytes} bytes, available {available_bytes} bytes")]
+    InsufficientDiskSpace {
+        required_bytes: u64,
+        available_bytes: u64,
+    },
+    #[error("Invalid FireWire GUID: {0}")]
+    InvalidFireWireGuid(String),
+    #[error("No active Device session")]
+    NoActiveDevice,
+    #[error("No interrupted Sync Batch to resolve")]
+    NoInterruptedBatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostDirectoryEntry {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostFile {
+    pub path: PathBuf,
+    pub file_name: String,
+    pub format: String,
+    pub file_size: u64,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub track_number: u32,
+    pub disc_number: u32,
+    pub genre: String,
+    pub year: u32,
+    pub duration_ms: u32,
+    pub bitrate_kbps: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostDirectoryListing {
+    pub current_path: PathBuf,
+    pub parent_path: Option<PathBuf>,
+    pub subdirectories: Vec<HostDirectoryEntry>,
+    pub files: Vec<HostFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,7 +170,9 @@ impl SystemHardwareDeviceAdapter {
         let entries = fs::read_dir(usb_root).ok()?;
         for entry in entries.flatten() {
             let dir = entry.path();
-            let vendor = fs::read_to_string(dir.join("idVendor")).ok()?;
+            let Ok(vendor) = fs::read_to_string(dir.join("idVendor")) else {
+                continue;
+            };
             if vendor.trim().eq_ignore_ascii_case("05ac") {
                 if let Ok(serial) = fs::read_to_string(dir.join("serial")) {
                     let trimmed = serial.trim();
@@ -189,12 +245,69 @@ pub struct DeviceLibrary {
     pub playlists: Vec<DevicePlaylist>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DuplicateResolution {
+    Skip,
+    ImportAnyway,
+    ReplaceExisting,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StagedTrackAddition {
+    pub staged_id: u64,
+    pub host_file: HostFile,
+    pub target_playlist_id: Option<u64>,
+    pub is_duplicate: bool,
+    pub matched_device_track_id: Option<u32>,
+    pub duplicate_resolution: DuplicateResolution,
+}
+
+impl StagedTrackAddition {
+    pub fn should_transfer(&self) -> bool {
+        !self.is_duplicate || self.duplicate_resolution != DuplicateResolution::Skip
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncBatch {
+    pub additions: Vec<StagedTrackAddition>,
+    pub required_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InterruptedBatchSummary {
+    pub completed_track_count: usize,
+    pub remaining_track_count: usize,
+    pub written_obfuscated_paths: Vec<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum InterruptedResolution {
+    CommitCompleted,
+    RollBack,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", content = "data", rename_all = "camelCase")]
+pub enum CommitOutcome {
+    Completed(DeviceSession),
+    Interrupted(InterruptedBatchSummary),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceSession {
     pub device: DeviceMetadata,
     pub library: DeviceLibrary,
     pub has_pending_play_counts: bool,
+    pub sync_batch: SyncBatch,
+    pub interrupted_batch: Option<InterruptedBatchSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,18 +318,50 @@ pub enum DeviceConnectionState {
     Connected(DeviceSession),
 }
 
+#[derive(Debug, Clone)]
+struct InterruptedJournal {
+    summary: InterruptedBatchSummary,
+    mount_path: PathBuf,
+    original_db_bytes: Vec<u8>,
+    partial_db: ItunesDb,
+    completed_staged_ids: Vec<u64>,
+    created_disk_paths: Vec<PathBuf>,
+    old_paths_to_remove: Vec<PathBuf>,
+    firewire_guid: Option<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct EngineState {
+    active_mount_path: Option<PathBuf>,
+    sync_batch: SyncBatch,
+    next_staged_id: u64,
+    next_obfuscated_counter: u64,
+    interrupted_journal: Option<InterruptedJournal>,
+}
+
 pub struct PodLoaderEngine<A: HardwareDeviceAdapter> {
     adapter: A,
+    state: RefCell<EngineState>,
 }
 
 impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
     pub fn new(adapter: A) -> Self {
-        Self { adapter }
+        Self {
+            adapter,
+            state: RefCell::new(EngineState {
+                active_mount_path: None,
+                sync_batch: SyncBatch::default(),
+                next_staged_id: 1,
+                next_obfuscated_counter: 1,
+                interrupted_journal: None,
+            }),
+        }
     }
 
     pub fn scan_device(&self) -> Result<DeviceConnectionState, PodLoaderError> {
         let volumes = self.adapter.list_mounted_volumes()?;
         let Some(vol) = volumes.into_iter().next() else {
+            self.state.borrow_mut().active_mount_path = None;
             return Ok(DeviceConnectionState::Disconnected);
         };
 
@@ -227,6 +372,7 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
             .join("iTunesDB");
 
         if !itunesdb_path.is_file() {
+            self.state.borrow_mut().active_mount_path = None;
             return Ok(DeviceConnectionState::UninitializedVolume(vol));
         }
 
@@ -287,6 +433,291 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
         Ok(parsed.to_bytes())
     }
 
+    pub fn browse_host_directory(
+        &self,
+        dir_path: &Path,
+    ) -> Result<HostDirectoryListing, PodLoaderError> {
+        host::browse_directory(dir_path)
+    }
+
+    pub fn stage_host_paths(
+        &mut self,
+        paths: &[PathBuf],
+        target_playlist_id: Option<u64>,
+    ) -> Result<SyncBatch, PodLoaderError> {
+        let current = match self.scan_device()? {
+            DeviceConnectionState::Connected(session) => session,
+            _ => return Err(PodLoaderError::NoActiveDevice),
+        };
+
+        let host_files = collect_host_files_from_paths(paths)?;
+        let mut st = self.state.borrow_mut();
+
+        for hf in host_files {
+            if !is_native_ipod_format(&hf.format) {
+                continue;
+            }
+            let matched = current.library.tracks.iter().find(|dt| {
+                normalize_tag_key(&dt.artist) == normalize_tag_key(&hf.artist)
+                    && normalize_tag_key(&dt.album) == normalize_tag_key(&hf.album)
+                    && normalize_tag_key(&dt.title) == normalize_tag_key(&hf.title)
+                    && dt.track_number == hf.track_number
+            });
+            let is_duplicate = matched.is_some();
+            let staged_id = st.next_staged_id;
+            st.next_staged_id += 1;
+
+            st.sync_batch.additions.push(StagedTrackAddition {
+                staged_id,
+                host_file: hf,
+                target_playlist_id,
+                is_duplicate,
+                matched_device_track_id: matched.map(|t| t.id),
+                duplicate_resolution: if is_duplicate {
+                    DuplicateResolution::Skip
+                } else {
+                    DuplicateResolution::ImportAnyway
+                },
+            });
+        }
+
+        recalculate_required_bytes(&mut st.sync_batch);
+        Ok(st.sync_batch.clone())
+    }
+
+    pub fn set_duplicate_resolution(
+        &mut self,
+        staged_id: u64,
+        resolution: DuplicateResolution,
+    ) -> Result<SyncBatch, PodLoaderError> {
+        let mut st = self.state.borrow_mut();
+        if st.active_mount_path.is_none() {
+            return Err(PodLoaderError::NoActiveDevice);
+        }
+        if let Some(item) = st
+            .sync_batch
+            .additions
+            .iter_mut()
+            .find(|a| a.staged_id == staged_id)
+        {
+            item.duplicate_resolution = resolution;
+        }
+        recalculate_required_bytes(&mut st.sync_batch);
+        Ok(st.sync_batch.clone())
+    }
+
+    pub fn commit_sync_batch(&mut self) -> Result<CommitOutcome, PodLoaderError> {
+        self.commit_sync_batch_with_limit(None)
+    }
+
+    pub fn commit_sync_batch_with_limit(
+        &mut self,
+        max_tracks_before_interrupt: Option<usize>,
+    ) -> Result<CommitOutcome, PodLoaderError> {
+        let current = match self.scan_device()? {
+            DeviceConnectionState::Connected(session) => session,
+            _ => return Err(PodLoaderError::NoActiveDevice),
+        };
+
+        let required_bytes = self.state.borrow().sync_batch.required_bytes;
+        if required_bytes > current.device.free_bytes {
+            return Err(PodLoaderError::InsufficientDiskSpace {
+                required_bytes,
+                available_bytes: current.device.free_bytes,
+            });
+        }
+
+        let mount_path = current.device.mount_path.clone();
+        let itunes_dir = mount_path.join("iPod_Control").join("iTunes");
+        let itunesdb_path = itunes_dir.join("iTunesDB");
+        let original_db_bytes = fs::read(&itunesdb_path)?;
+        let mut parsed_db = ItunesDb::parse(&original_db_bytes)?;
+
+        let play_counts_path = itunes_dir.join("Play Counts");
+        if play_counts_path.is_file() {
+            let pc_bytes = fs::read(&play_counts_path)?;
+            let entries = parse_play_counts(&pc_bytes)?;
+            parsed_db.merge_play_counts(&entries);
+        }
+
+        let active_additions: Vec<StagedTrackAddition> = self
+            .state
+            .borrow()
+            .sync_batch
+            .additions
+            .iter()
+            .filter(|a| a.should_transfer())
+            .cloned()
+            .collect();
+
+        let total_active = active_additions.len();
+        let mut completed_staged_ids: Vec<u64> = Vec::new();
+        let mut created_disk_paths: Vec<PathBuf> = Vec::new();
+        let mut written_obfuscated_paths: Vec<String> = Vec::new();
+        let mut old_paths_to_remove: Vec<PathBuf> = Vec::new();
+        let mut interruption_reason: Option<String> = None;
+
+        for (idx, item) in active_additions.iter().enumerate() {
+            if let Some(limit) = max_tracks_before_interrupt {
+                if idx >= limit {
+                    interruption_reason = Some("Transfer interrupted mid-batch".to_string());
+                    break;
+                }
+            }
+
+            let (disk_path, obfuscated_path) = {
+                let mut st = self.state.borrow_mut();
+                allocate_obfuscated_path(
+                    &mount_path,
+                    &item.host_file.path,
+                    &mut st.next_obfuscated_counter,
+                )?
+            };
+
+            if let Some(parent) = disk_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if let Err(err) = copy_file_bytes(&item.host_file.path, &disk_path) {
+                if !completed_staged_ids.is_empty() {
+                    interruption_reason = Some(err.to_string());
+                    break;
+                }
+                return Err(PodLoaderError::Io(err));
+            }
+
+            let replace_id = if item.is_duplicate
+                && item.duplicate_resolution == DuplicateResolution::ReplaceExisting
+            {
+                item.matched_device_track_id
+            } else {
+                None
+            };
+
+            let (_track_id, old_obfuscated) = parsed_db.upsert_transferred_track(
+                &item.host_file,
+                &obfuscated_path,
+                replace_id,
+                item.target_playlist_id,
+            );
+            if let Some(old_obf) = old_obfuscated {
+                let old_disk = obfuscated_to_disk_path(&mount_path, &old_obf);
+                if old_disk != disk_path {
+                    old_paths_to_remove.push(old_disk);
+                }
+            }
+
+            completed_staged_ids.push(item.staged_id);
+            created_disk_paths.push(disk_path);
+            written_obfuscated_paths.push(obfuscated_path);
+        }
+
+        if let Some(reason) = interruption_reason {
+            let summary = InterruptedBatchSummary {
+                completed_track_count: completed_staged_ids.len(),
+                remaining_track_count: total_active.saturating_sub(completed_staged_ids.len()),
+                written_obfuscated_paths,
+                reason,
+            };
+            self.state.borrow_mut().interrupted_journal = Some(InterruptedJournal {
+                summary: summary.clone(),
+                mount_path,
+                original_db_bytes,
+                partial_db: parsed_db,
+                completed_staged_ids,
+                created_disk_paths,
+                old_paths_to_remove,
+                firewire_guid: current.device.firewire_guid,
+            });
+            return Ok(CommitOutcome::Interrupted(summary));
+        }
+
+        finalize_itunesdb_commit(
+            &mount_path,
+            &original_db_bytes,
+            &mut parsed_db,
+            current.device.firewire_guid.as_deref(),
+            &old_paths_to_remove,
+        )?;
+
+        {
+            let mut st = self.state.borrow_mut();
+            st.sync_batch = SyncBatch::default();
+            st.interrupted_journal = None;
+        }
+
+        match self.scan_device()? {
+            DeviceConnectionState::Connected(updated_session) => {
+                Ok(CommitOutcome::Completed(updated_session))
+            }
+            _ => Err(PodLoaderError::NoActiveDevice),
+        }
+    }
+
+    pub fn set_manual_firewire_guid(
+        &mut self,
+        guid: &str,
+    ) -> Result<DeviceSession, PodLoaderError> {
+        let _ = parse_firewire_guid_bytes(guid)?;
+        let current = match self.scan_device()? {
+            DeviceConnectionState::Connected(session) => session,
+            _ => return Err(PodLoaderError::NoActiveDevice),
+        };
+        let sysinfo_path = current
+            .device
+            .mount_path
+            .join("iPod_Control")
+            .join("Device")
+            .join("SysInfo");
+        cache_guid_in_sysinfo(&sysinfo_path, guid)?;
+
+        match self.scan_device()? {
+            DeviceConnectionState::Connected(updated) => Ok(updated),
+            _ => Err(PodLoaderError::NoActiveDevice),
+        }
+    }
+
+    pub fn resolve_interrupted_batch(
+        &mut self,
+        resolution: InterruptedResolution,
+    ) -> Result<DeviceSession, PodLoaderError> {
+        let journal = self
+            .state
+            .borrow_mut()
+            .interrupted_journal
+            .take()
+            .ok_or(PodLoaderError::NoInterruptedBatch)?;
+
+        match resolution {
+            InterruptedResolution::RollBack => {
+                for disk_path in journal.created_disk_paths {
+                    if disk_path.is_file() {
+                        let _ = fs::remove_file(disk_path);
+                    }
+                }
+            }
+            InterruptedResolution::CommitCompleted => {
+                let mut partial_db = journal.partial_db;
+                finalize_itunesdb_commit(
+                    &journal.mount_path,
+                    &journal.original_db_bytes,
+                    &mut partial_db,
+                    journal.firewire_guid.as_deref(),
+                    &journal.old_paths_to_remove,
+                )?;
+                let mut st = self.state.borrow_mut();
+                st.sync_batch
+                    .additions
+                    .retain(|a| !journal.completed_staged_ids.contains(&a.staged_id));
+                recalculate_required_bytes(&mut st.sync_batch);
+            }
+        }
+
+        match self.scan_device()? {
+            DeviceConnectionState::Connected(updated) => Ok(updated),
+            _ => Err(PodLoaderError::NoActiveDevice),
+        }
+    }
+
     fn load_connected_session(
         &self,
         vol: MountedVolume,
@@ -344,6 +775,19 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
 
         let used_bytes = vol.total_bytes.saturating_sub(vol.free_bytes);
 
+        let (sync_batch, interrupted_batch) = {
+            let mut st = self.state.borrow_mut();
+            if st.active_mount_path.as_ref() != Some(&vol.mount_path) {
+                st.active_mount_path = Some(vol.mount_path.clone());
+                st.sync_batch = SyncBatch::default();
+                st.interrupted_journal = None;
+            }
+            (
+                st.sync_batch.clone(),
+                st.interrupted_journal.as_ref().map(|j| j.summary.clone()),
+            )
+        };
+
         Ok(DeviceConnectionState::Connected(DeviceSession {
             device: DeviceMetadata {
                 mount_path: vol.mount_path,
@@ -356,6 +800,140 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
             },
             library,
             has_pending_play_counts,
+            sync_batch,
+            interrupted_batch,
         }))
     }
+}
+
+fn finalize_itunesdb_commit(
+    mount_path: &Path,
+    original_db_bytes: &[u8],
+    parsed_db: &mut ItunesDb,
+    firewire_guid: Option<&str>,
+    old_paths_to_remove: &[PathBuf],
+) -> Result<(), PodLoaderError> {
+    let itunes_dir = mount_path.join("iPod_Control").join("iTunes");
+    let itunesdb_path = itunes_dir.join("iTunesDB");
+    let play_counts_path = itunes_dir.join("Play Counts");
+    let bak_path = itunes_dir.join("iTunesDB.bak");
+
+    fs::write(&bak_path, original_db_bytes)?;
+
+    if let Some(guid) = firewire_guid {
+        parsed_db.ensure_mhbd_header_min_len(244);
+        let mut new_db_bytes = parsed_db.to_bytes();
+        sign_itunesdb(&mut new_db_bytes, guid)?;
+        atomic_write_file(&itunesdb_path, &new_db_bytes)?;
+    } else {
+        let new_db_bytes = parsed_db.to_bytes();
+        atomic_write_file(&itunesdb_path, &new_db_bytes)?;
+    }
+
+    if play_counts_path.is_file() {
+        let _ = fs::remove_file(&play_counts_path);
+    }
+    for old_file in old_paths_to_remove {
+        if old_file.is_file() {
+            let _ = fs::remove_file(old_file);
+        }
+    }
+    Ok(())
+}
+
+fn normalize_tag_key(val: &str) -> String {
+    val.trim().to_lowercase()
+}
+
+fn recalculate_required_bytes(batch: &mut SyncBatch) {
+    batch.required_bytes = batch
+        .additions
+        .iter()
+        .filter(|a| a.should_transfer())
+        .map(|a| a.host_file.file_size)
+        .sum();
+}
+
+fn allocate_obfuscated_path(
+    mount_path: &Path,
+    source_path: &Path,
+    counter: &mut u64,
+) -> Result<(PathBuf, String), PodLoaderError> {
+    let ext = source_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mp3")
+        .to_ascii_lowercase();
+
+    let time_entropy = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15);
+
+    let mut path_hash = 0xcbf29ce484222325u64;
+    for b in source_path.to_string_lossy().as_bytes() {
+        path_hash ^= *b as u64;
+        path_hash = path_hash.wrapping_mul(0x100000001b3);
+    }
+
+    loop {
+        let n = *counter;
+        *counter += 1;
+
+        let mut z = time_entropy
+            .wrapping_add(path_hash)
+            .wrapping_add(n.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+
+        let folder_idx = (z % 50) as u32;
+        let folder_name = format!("F{:02}", folder_idx);
+
+        let mut code = z >> 8;
+        let mut letters = [b'A'; 4];
+        for slot in &mut letters {
+            *slot = b'A' + ((code % 26) as u8);
+            code /= 26;
+        }
+        let stem = std::str::from_utf8(&letters).unwrap_or("AAAA");
+        let file_name = format!("{}.{}", stem, ext);
+        let disk_path = mount_path
+            .join("iPod_Control")
+            .join("Music")
+            .join(&folder_name)
+            .join(&file_name);
+
+        if !disk_path.exists() {
+            let obfuscated = format!(":iPod_Control:Music:{}:{}", folder_name, file_name);
+            return Ok((disk_path, obfuscated));
+        }
+    }
+}
+
+fn obfuscated_to_disk_path(mount_path: &Path, obfuscated_path: &str) -> PathBuf {
+    let rel = obfuscated_path.trim_start_matches(':').replace(':', "/");
+    mount_path.join(rel)
+}
+
+fn copy_file_bytes(src: &Path, dst: &Path) -> std::io::Result<u64> {
+    let mut reader = fs::File::open(src)?;
+    let mut writer = fs::File::create(dst)?;
+    let copied = std::io::copy(&mut reader, &mut writer)?;
+    let _ = writer.sync_all();
+    Ok(copied)
+}
+
+fn atomic_write_file(target_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp_path = target_path.with_extension("tmp");
+    {
+        let mut file = fs::File::create(&tmp_path)?;
+        file.write_all(bytes)?;
+        let _ = file.sync_all();
+    }
+    if fs::rename(&tmp_path, target_path).is_err() {
+        fs::write(target_path, bytes)?;
+        let _ = fs::remove_file(&tmp_path);
+    }
+    Ok(())
 }

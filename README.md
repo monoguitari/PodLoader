@@ -22,7 +22,7 @@ export RUSTUP_HOME="/home/jesus/.cache/rustup"
    - Mount that Windows drive into WSL2 if it isn't mounted automatically:
      ```bash
      sudo mkdir -p /mnt/d
-     sudo mount -t drvfs D: /mnt/d
+     sudo mount -t drvfs D: /mnt/d -o uid=$(id -u),gid=$(id -g)
      ```
    - Verify the `iPod_Control` folder is visible:
      ```bash
@@ -73,6 +73,25 @@ npm run dev
 ```
 
 Then open **http://localhost:5173** in your browser to browse your iPod's storage summary, playlists (`Master Playlist`, `Device Playlists`, `Smart Playlists`), and ordered `Device Tracks` table (or run `Device Initialization` on a freshly formatted drive).
+
+### Browsing Host Files & Syncing Audio to Your iPod
+
+1. **Check `FireWire GUID` (for 2007+ iPods such as Classic 6G/7G and Nano 3G/4G)**:
+   - Look at the top header. If `FireWire GUID` is displayed, PodLoader read it from `iPod_Control/Device/SysInfo` (or USB) and will automatically sign `iTunesDB` with `hash58`/`hash72`.
+   - If your iPod is a 2007+ model and no `FireWire GUID` is shown, enter your 16-character hex `FireWire GUID` in the **Manual FireWire GUID** field and click **Save GUID** (this caches it into `iPod_Control/Device/SysInfo`).
+2. **Browse Local Music (`Host Files` Pane)**:
+   - Enter any folder path on your computer containing iPod-native audio files (`.mp3`, `.m4a`, `.aac`, `.alac`, `.wav`) — for example `/mnt/c/Users/<YourWindowsUser>/Music` or `/home/jesus/music` — and click **Browse** (or navigate using `📁` subfolders and **⬆️ Parent Folder**).
+3. **Stage Tracks into the `Sync Batch`**:
+   - Click **Stage** next to an individual track, **Stage Folder** next to a subfolder, **Stage All to Sync Batch** for the current directory, or **drag and drop** a track/folder onto the **Device Tracks** table or a user **Device Playlist** in the sidebar.
+   - Any track matching an existing `Device Track` by `(Artist, Album, Title, Track #)` is flagged as **Duplicate** and defaults to **Skip**; use the per-item dropdown to switch between **Skip**, **Import Anyway**, or **Replace Existing**.
+4. **Commit the `Sync Batch`**:
+   - Click **Commit Sync Batch**. PodLoader verifies free disk space, copies the audio files into randomized `iPod_Control/Music/F00`–`F49` paths, backs up the previous database to `iPod_Control/iTunes/iTunesDB.bak`, atomically writes and signs `iTunesDB`, and updates the UI.
+   - If a transfer is paused or interrupted mid-batch, choose between **Commit Completed Tracks** or **Roll Back Batch**.
+5. **Safely Unmount Your iPod**:
+   ```bash
+   sudo umount /mnt/d
+   ```
+   Then safely eject the iPod in your OS before unplugging the USB cable.
 
 ---
 
