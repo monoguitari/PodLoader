@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "dev:backend": "cargo run -p podloader-shell -- --serve",
-    "inspect": "cargo run -p podloader-shell --",
+    "dev:backend": "PATH=\"$HOME/.cache/cargo/bin:$PATH\" CARGO_HOME=\"${CARGO_HOME:-$HOME/.cache/cargo}\" RUSTUP_HOME=\"${RUSTUP_HOME:-$HOME/.cache/rustup}\" cargo run --offline -p podloader-shell -- --serve",
+    "inspect": "PATH=\"$HOME/.cache/cargo/bin:$PATH\" CARGO_HOME=\"${CARGO_HOME:-$HOME/.cache/cargo}\" RUSTUP_HOME=\"${RUSTUP_HOME:-$HOME/.cache/rustup}\" cargo run --offline -p podloader-shell --",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
