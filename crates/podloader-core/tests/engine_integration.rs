@@ -1347,15 +1347,29 @@ fn updates_master_playlist_index_mhods_mhsd_type3_and_re_signs_extracted_hash72(
         .expect("create Fxx");
     }
 
-    // Build a database with a 624-byte mhit, mhsd type 3 + mhsd type 2 Master Playlists containing mhod 52 & 53,
+    // Build a database with two 624-byte mhits ("After Dark" at index 0 and "Zebra" at index 1),
+    // mhsd type 3 + mhsd type 2 Master Playlists containing mhod 52 & 53,
     // and a valid hash72 signature (without setting FireWireGuid in SysInfo).
-    let mut mhit = build_mhit_fixture(
+    let expand_mhit_to_624 = |mhit: Vec<u8>| -> Vec<u8> {
+        let old_hdr_len = u32::from_le_bytes([mhit[4], mhit[5], mhit[6], mhit[7]]) as usize;
+        let body_bytes = mhit[old_hdr_len..].to_vec();
+        let mut hdr624 = vec![0u8; 624];
+        hdr624[..old_hdr_len].copy_from_slice(&mhit[..old_hdr_len]);
+        let new_total = (624 + body_bytes.len()) as u32;
+        hdr624[4..8].copy_from_slice(&624u32.to_le_bytes());
+        hdr624[8..12].copy_from_slice(&new_total.to_le_bytes());
+        hdr624[208..212].copy_from_slice(&1u32.to_le_bytes()); // media_type = Audio
+        hdr624.extend_from_slice(&body_bytes);
+        hdr624
+    };
+
+    let mhit_a = expand_mhit_to_624(build_mhit_fixture(
         101,
-        "Existing Track",
-        "Existing Artist",
-        "Existing Album",
+        "After Dark",
+        "Artist A",
+        "Album A",
         "Rock",
-        ":iPod_Control:Music:F00:EXST.mp3",
+        ":iPod_Control:Music:F00:EXSA.mp3",
         1,
         1,
         2024,
@@ -1364,44 +1378,59 @@ fn updates_master_playlist_index_mhods_mhsd_type3_and_re_signs_extracted_hash72(
         0,
         0,
         vec![],
-    );
-    // Expand mhit header from 244 to 624 bytes
-    let old_hdr_len = u32::from_le_bytes([mhit[4], mhit[5], mhit[6], mhit[7]]) as usize;
-    let body_bytes = mhit[old_hdr_len..].to_vec();
-    let mut hdr624 = vec![0u8; 624];
-    hdr624[..old_hdr_len].copy_from_slice(&mhit[..old_hdr_len]);
-    let new_total = (624 + body_bytes.len()) as u32;
-    hdr624[4..8].copy_from_slice(&624u32.to_le_bytes());
-    hdr624[8..12].copy_from_slice(&new_total.to_le_bytes());
-    hdr624[208..212].copy_from_slice(&1u32.to_le_bytes()); // media_type = Audio
-    hdr624.extend_from_slice(&body_bytes);
-    mhit = hdr624;
+    ));
+    let mhit_z = expand_mhit_to_624(build_mhit_fixture(
+        102,
+        "Zebra",
+        "Artist Z",
+        "Album Z",
+        "Rock",
+        ":iPod_Control:Music:F00:EXSZ.mp3",
+        2,
+        1,
+        2024,
+        200_000,
+        320,
+        0,
+        0,
+        vec![],
+    ));
 
-    let mut mhod52 = vec![0u8; 76];
+    let mut mhod52 = vec![0u8; 80];
     mhod52[0..4].copy_from_slice(b"mhod");
     mhod52[4..8].copy_from_slice(&24u32.to_le_bytes());
-    mhod52[8..12].copy_from_slice(&76u32.to_le_bytes());
+    mhod52[8..12].copy_from_slice(&80u32.to_le_bytes());
     mhod52[12..16].copy_from_slice(&52u32.to_le_bytes());
-    mhod52[24..28].copy_from_slice(&3u32.to_le_bytes());
-    mhod52[28..32].copy_from_slice(&1u32.to_le_bytes()); // count = 1
-    mhod52[72..76].copy_from_slice(&0u32.to_le_bytes()); // index 0
+    mhod52[24..28].copy_from_slice(&3u32.to_le_bytes()); // sort_type = 3 (Title)
+    mhod52[28..32].copy_from_slice(&2u32.to_le_bytes()); // count = 2
+    mhod52[72..76].copy_from_slice(&0u32.to_le_bytes()); // index 0 ("After Dark")
+    mhod52[76..80].copy_from_slice(&1u32.to_le_bytes()); // index 1 ("Zebra")
 
-    let mut mhod53 = vec![0u8; 52];
+    let mut mhod53 = vec![0u8; 64];
     mhod53[0..4].copy_from_slice(b"mhod");
     mhod53[4..8].copy_from_slice(&24u32.to_le_bytes());
-    mhod53[8..12].copy_from_slice(&52u32.to_le_bytes());
+    mhod53[8..12].copy_from_slice(&64u32.to_le_bytes());
     mhod53[12..16].copy_from_slice(&53u32.to_le_bytes());
     mhod53[24..28].copy_from_slice(&3u32.to_le_bytes());
-    mhod53[28..32].copy_from_slice(&1u32.to_le_bytes()); // 1 entry
-    mhod53[48..52].copy_from_slice(&1u32.to_le_bytes()); // num_entries = 1
+    mhod53[28..32].copy_from_slice(&2u32.to_le_bytes()); // 2 entries ('A' and 'Z')
+    // Entry 0: 'A' (0x0041), start = 0, count = 1
+    mhod53[40..42].copy_from_slice(&(b'A' as u16).to_le_bytes());
+    mhod53[44..48].copy_from_slice(&0u32.to_le_bytes());
+    mhod53[48..52].copy_from_slice(&1u32.to_le_bytes());
+    // Entry 1: 'Z' (0x005A), start = 1, count = 1
+    mhod53[52..54].copy_from_slice(&(b'Z' as u16).to_le_bytes());
+    mhod53[56..60].copy_from_slice(&1u32.to_le_bytes());
+    mhod53[60..64].copy_from_slice(&1u32.to_le_bytes());
 
-    let master_mhyp = build_mhyp_fixture(1000, "My iPod", true, vec![mhod52, mhod53], &[101]);
+    let master_mhyp =
+        build_mhyp_fixture(1000, "My iPod", true, vec![mhod52, mhod53], &[101, 102]);
 
     let mut mhlt = vec![0u8; 92];
     mhlt[0..4].copy_from_slice(b"mhlt");
     mhlt[4..8].copy_from_slice(&92u32.to_le_bytes());
-    mhlt[8..12].copy_from_slice(&1u32.to_le_bytes());
-    mhlt.extend_from_slice(&mhit);
+    mhlt[8..12].copy_from_slice(&2u32.to_le_bytes());
+    mhlt.extend_from_slice(&mhit_a);
+    mhlt.extend_from_slice(&mhit_z);
 
     let mut mhsd_tracks = vec![0u8; 96];
     mhsd_tracks[0..4].copy_from_slice(b"mhsd");
@@ -1458,10 +1487,18 @@ fn updates_master_playlist_index_mhods_mhsd_type3_and_re_signs_extracted_hash72(
     fs::write(&itunesdb_path, &db_bytes).expect("write initial iTunesDB");
 
     let host_temp = TempDir::new().expect("create host temp");
-    let mp3_path = host_temp.path().join("02 - New Song.mp3");
+    let mp3_path = host_temp.path().join("drunken_sailor.mp3");
     fs::write(
         &mp3_path,
-        build_id3v23_mp3_fixture("New Song", "New Artist", "New Album", 2, "Pop", 2025, 4),
+        build_id3v23_mp3_fixture(
+            "drunken_sailor",
+            "Sea Shanties",
+            "Sailing Songs",
+            3,
+            "Folk",
+            2025,
+            4,
+        ),
     )
     .expect("write mp3");
 
@@ -1479,10 +1516,10 @@ fn updates_master_playlist_index_mhods_mhsd_type3_and_re_signs_extracted_hash72(
     let outcome = engine.commit_sync_batch().expect("commit");
     match outcome {
         CommitOutcome::Completed(session) => {
-            assert_eq!(session.library.tracks.len(), 2);
+            assert_eq!(session.library.tracks.len(), 3);
             // UI playlists should not be duplicated even though both mhsd type 3 and type 2 exist
             assert_eq!(session.library.playlists.len(), 1);
-            assert_eq!(session.library.playlists[0].track_ids.len(), 2);
+            assert_eq!(session.library.playlists[0].track_ids.len(), 3);
         }
         other => panic!("expected Completed, got {:?}", other),
     }
@@ -1494,6 +1531,53 @@ fn updates_master_playlist_index_mhods_mhsd_type3_and_re_signs_extracted_hash72(
         Some((iv, rand12)),
         "expected updated iTunesDB to have a valid re-signed hash72"
     );
+
+    // Verify mhod 52 sorted "drunken_sailor" (mhlt index 2) between "After Dark" (0) and "Zebra" (1) -> [0, 2, 1],
+    // and mhod 53 jump table now has 3 entries: 'A' (0, 1), 'D' (1, 1), 'Z' (2, 1).
+    let mut found_mhod52 = 0usize;
+    let mut found_mhod53 = 0usize;
+    for pos in 0..updated_bytes.len().saturating_sub(76) {
+        if &updated_bytes[pos..pos + 4] == b"mhod"
+            && u32::from_le_bytes(updated_bytes[pos + 4..pos + 8].try_into().unwrap()) == 24
+        {
+            let mtype = u32::from_le_bytes(updated_bytes[pos + 12..pos + 16].try_into().unwrap());
+            if mtype == 52 {
+                found_mhod52 += 1;
+                let idx0 =
+                    u32::from_le_bytes(updated_bytes[pos + 72..pos + 76].try_into().unwrap());
+                let idx1 =
+                    u32::from_le_bytes(updated_bytes[pos + 76..pos + 80].try_into().unwrap());
+                let idx2 =
+                    u32::from_le_bytes(updated_bytes[pos + 80..pos + 84].try_into().unwrap());
+                assert_eq!(
+                    [idx0, idx1, idx2],
+                    [0, 2, 1],
+                    "expected 'drunken_sailor' (idx 2) to be sorted between 'After Dark' (0) and 'Zebra' (1)"
+                );
+            } else if mtype == 53 {
+                found_mhod53 += 1;
+                let entry_cnt =
+                    u32::from_le_bytes(updated_bytes[pos + 28..pos + 32].try_into().unwrap());
+                assert_eq!(entry_cnt, 3);
+                let ch_d =
+                    u16::from_le_bytes(updated_bytes[pos + 52..pos + 54].try_into().unwrap());
+                let start_d =
+                    u32::from_le_bytes(updated_bytes[pos + 56..pos + 60].try_into().unwrap());
+                let count_d =
+                    u32::from_le_bytes(updated_bytes[pos + 60..pos + 64].try_into().unwrap());
+                assert_eq!((ch_d, start_d, count_d), (b'D' as u16, 1, 1));
+                let ch_z =
+                    u16::from_le_bytes(updated_bytes[pos + 64..pos + 66].try_into().unwrap());
+                let start_z =
+                    u32::from_le_bytes(updated_bytes[pos + 68..pos + 72].try_into().unwrap());
+                let count_z =
+                    u32::from_le_bytes(updated_bytes[pos + 72..pos + 76].try_into().unwrap());
+                assert_eq!((ch_z, start_z, count_z), (b'Z' as u16, 2, 1));
+            }
+        }
+    }
+    assert_eq!(found_mhod52, 2, "expected mhod 52 in both mhsd type 3 and type 2");
+    assert_eq!(found_mhod53, 2, "expected mhod 53 in both mhsd type 3 and type 2");
 }
 
 

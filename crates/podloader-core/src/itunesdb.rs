@@ -386,6 +386,17 @@ impl ItunesDb {
         new_track_mhlt_index: Option<usize>,
         target_playlist_id: Option<u64>,
     ) {
+        let sort_fields: Vec<TrackSortFields> = self
+            .datasets
+            .iter()
+            .find_map(|ds| match &ds.body {
+                MhsdBody::TrackList { tracks, .. } => {
+                    Some(tracks.iter().map(TrackSortFields::from_mhit).collect())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+
         for ds in &mut self.datasets {
             if let MhsdBody::PlaylistList { playlists, .. } = &mut ds.body {
                 for pl in playlists {
@@ -398,7 +409,11 @@ impl ItunesDb {
 
                         if pl.playlist.kind == PlaylistKind::Master {
                             if let Some(track_idx) = new_track_mhlt_index {
-                                update_master_playlist_index_mhods(&mut pl.mhods, track_idx as u32);
+                                update_master_playlist_index_mhods(
+                                    &mut pl.mhods,
+                                    track_idx as u32,
+                                    &sort_fields,
+                                );
                             }
                         }
                     }
@@ -408,31 +423,319 @@ impl ItunesDb {
     }
 }
 
-fn update_master_playlist_index_mhods(mhods: &mut [MhodChunk], new_track_idx: u32) {
+#[derive(Debug, Clone)]
+struct TrackSortFields {
+    title_sort: String,
+    album_sort: String,
+    artist_sort: String,
+    album_artist_sort: String,
+    genre_sort: String,
+    composer_sort: String,
+    disc_number: u32,
+    track_number: u32,
+}
+
+impl TrackSortFields {
+    fn from_mhit(chunk: &MhitChunk) -> Self {
+        let mut sort_title: Option<String> = None;
+        let mut sort_album: Option<String> = None;
+        let mut sort_artist: Option<String> = None;
+        let mut sort_album_artist: Option<String> = None;
+        let mut sort_composer: Option<String> = None;
+        let mut album_artist: Option<String> = None;
+        let mut composer: Option<String> = None;
+
+        for m in &chunk.mhods {
+            match m.mhod_type {
+                12 => composer = decode_mhod_string(&m.raw_bytes),
+                22 => album_artist = decode_mhod_string(&m.raw_bytes),
+                27 => sort_title = decode_mhod_string(&m.raw_bytes),
+                28 => sort_artist = decode_mhod_string(&m.raw_bytes),
+                29 => sort_album = decode_mhod_string(&m.raw_bytes),
+                30 => sort_album_artist = decode_mhod_string(&m.raw_bytes),
+                31 => sort_composer = decode_mhod_string(&m.raw_bytes),
+                _ => {}
+            }
+        }
+
+        let title_sort = normalize_sort_key(sort_title.as_deref(), &chunk.track.title);
+        let album_sort = normalize_sort_key(sort_album.as_deref(), &chunk.track.album);
+        let artist_sort = normalize_sort_key(sort_artist.as_deref(), &chunk.track.artist);
+        let fallback_album_artist = album_artist
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&chunk.track.artist);
+        let album_artist_sort =
+            normalize_sort_key(sort_album_artist.as_deref(), fallback_album_artist);
+        let genre_sort = normalize_sort_key(None, &chunk.track.genre);
+        let composer_sort =
+            normalize_sort_key(sort_composer.as_deref(), composer.as_deref().unwrap_or(""));
+
+        Self {
+            title_sort,
+            album_sort,
+            artist_sort,
+            album_artist_sort,
+            genre_sort,
+            composer_sort,
+            disc_number: chunk.track.disc_number,
+            track_number: chunk.track.track_number,
+        }
+    }
+
+    fn primary_str(&self, sort_type: u32) -> &str {
+        match sort_type {
+            4 => &self.album_sort,
+            5 => &self.artist_sort,
+            7 => &self.genre_sort,
+            18 => &self.composer_sort,
+            35 | 36 => &self.album_artist_sort,
+            _ => &self.title_sort,
+        }
+    }
+}
+
+fn normalize_sort_key(explicit_sort: Option<&str>, raw_val: &str) -> String {
+    if let Some(s) = explicit_sort {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_lowercase();
+        }
+    }
+    let trimmed = raw_val.trim();
+    let lower = trimmed.to_lowercase();
+    for prefix in ["the ", "a ", "an "] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            let rest_trimmed = rest.trim_start();
+            if !rest_trimmed.is_empty() {
+                return rest_trimmed.to_string();
+            }
+        }
+    }
+    lower
+}
+
+/// Returns `(jump_table_utf16_char, bucket_rank)` matching Apple's `mhod` 52/53 ordering:
+/// - `'A'..'Z'` (`0x0041..=0x005A`) -> rank `0..=25`
+/// - `'0'` (`0x0030`, digits and punctuation) -> rank `26`
+/// - `'\0'` (`0x0000`, empty string) -> rank `27`
+fn jump_table_letter_and_rank(s: &str) -> (u16, u8) {
+    let trimmed = s.trim();
+    let Some(first_ch) = trimmed.chars().next() else {
+        return (0x0000, 27);
+    };
+    if first_ch.is_ascii_alphabetic() {
+        let upper = first_ch.to_ascii_uppercase() as u8;
+        (upper as u16, upper - b'A')
+    } else {
+        (0x0030, 26)
+    }
+}
+
+fn letter_u16_to_rank(ch: u16) -> u8 {
+    if (0x0041..=0x005A).contains(&ch) {
+        (ch as u8) - b'A'
+    } else if ch == 0x0030 {
+        26
+    } else {
+        27
+    }
+}
+
+fn cmp_sort_str(a: &str, b: &str) -> std::cmp::Ordering {
+    let (_, rank_a) = jump_table_letter_and_rank(a);
+    let (_, rank_b) = jump_table_letter_and_rank(b);
+    rank_a.cmp(&rank_b).then_with(|| a.cmp(b))
+}
+
+fn compare_tracks_for_sort_type(
+    a: &TrackSortFields,
+    b: &TrackSortFields,
+    sort_type: u32,
+) -> std::cmp::Ordering {
+    match sort_type {
+        4 => cmp_sort_str(&a.album_sort, &b.album_sort)
+            .then_with(|| a.disc_number.cmp(&b.disc_number))
+            .then_with(|| a.track_number.cmp(&b.track_number))
+            .then_with(|| cmp_sort_str(&a.title_sort, &b.title_sort)),
+        5 => cmp_sort_str(&a.artist_sort, &b.artist_sort)
+            .then_with(|| cmp_sort_str(&a.album_sort, &b.album_sort))
+            .then_with(|| a.disc_number.cmp(&b.disc_number))
+            .then_with(|| a.track_number.cmp(&b.track_number))
+            .then_with(|| cmp_sort_str(&a.title_sort, &b.title_sort)),
+        35 | 36 => cmp_sort_str(&a.album_artist_sort, &b.album_artist_sort)
+            .then_with(|| cmp_sort_str(&a.album_sort, &b.album_sort))
+            .then_with(|| a.disc_number.cmp(&b.disc_number))
+            .then_with(|| a.track_number.cmp(&b.track_number))
+            .then_with(|| cmp_sort_str(&a.title_sort, &b.title_sort)),
+        7 => cmp_sort_str(&a.genre_sort, &b.genre_sort)
+            .then_with(|| cmp_sort_str(&a.artist_sort, &b.artist_sort))
+            .then_with(|| cmp_sort_str(&a.album_sort, &b.album_sort))
+            .then_with(|| a.disc_number.cmp(&b.disc_number))
+            .then_with(|| a.track_number.cmp(&b.track_number))
+            .then_with(|| cmp_sort_str(&a.title_sort, &b.title_sort)),
+        18 => cmp_sort_str(&a.composer_sort, &b.composer_sort)
+            .then_with(|| cmp_sort_str(&a.album_sort, &b.album_sort))
+            .then_with(|| a.disc_number.cmp(&b.disc_number))
+            .then_with(|| a.track_number.cmp(&b.track_number))
+            .then_with(|| cmp_sort_str(&a.title_sort, &b.title_sort)),
+        _ => cmp_sort_str(&a.title_sort, &b.title_sort)
+            .then_with(|| cmp_sort_str(&a.artist_sort, &b.artist_sort)),
+    }
+}
+
+fn update_master_playlist_index_mhods(
+    mhods: &mut [MhodChunk],
+    new_track_idx: u32,
+    sort_fields: &[TrackSortFields],
+) {
+    let new_track = sort_fields.get(new_track_idx as usize);
+    let mut insert_positions_by_sort_type: std::collections::HashMap<u32, (usize, usize)> =
+        std::collections::HashMap::new();
+
     for mhod in mhods.iter_mut() {
         if mhod.mhod_type == 52 && mhod.raw_bytes.len() >= 72 {
+            let sort_type = u32::from_le_bytes([
+                mhod.raw_bytes[24],
+                mhod.raw_bytes[25],
+                mhod.raw_bytes[26],
+                mhod.raw_bytes[27],
+            ]);
             let old_count = u32::from_le_bytes([
                 mhod.raw_bytes[28],
                 mhod.raw_bytes[29],
                 mhod.raw_bytes[30],
                 mhod.raw_bytes[31],
-            ]);
-            let new_count = old_count.saturating_add(1);
-            mhod.raw_bytes.extend_from_slice(&new_track_idx.to_le_bytes());
+            ]) as usize;
+            let available = (mhod.raw_bytes.len() - 72) / 4;
+            let count = old_count.min(available);
+
+            let mut indices = Vec::with_capacity(count + 1);
+            for i in 0..count {
+                let off = 72 + i * 4;
+                let idx = u32::from_le_bytes([
+                    mhod.raw_bytes[off],
+                    mhod.raw_bytes[off + 1],
+                    mhod.raw_bytes[off + 2],
+                    mhod.raw_bytes[off + 3],
+                ]);
+                indices.push(idx);
+            }
+
+            let insert_pos = if let Some(nt) = new_track {
+                indices
+                    .iter()
+                    .position(|&existing_idx| {
+                        sort_fields
+                            .get(existing_idx as usize)
+                            .map(|et| {
+                                compare_tracks_for_sort_type(nt, et, sort_type)
+                                    == std::cmp::Ordering::Less
+                            })
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(indices.len())
+            } else {
+                indices.len()
+            };
+
+            indices.insert(insert_pos, new_track_idx);
+            insert_positions_by_sort_type.insert(sort_type, (insert_pos, count));
+
+            mhod.raw_bytes.truncate(72);
+            mhod.raw_bytes.reserve(indices.len() * 4);
+            for idx in &indices {
+                mhod.raw_bytes.extend_from_slice(&idx.to_le_bytes());
+            }
+            let new_count = indices.len() as u32;
             let new_total_len = mhod.raw_bytes.len() as u32;
             mhod.raw_bytes[8..12].copy_from_slice(&new_total_len.to_le_bytes());
             mhod.raw_bytes[28..32].copy_from_slice(&new_count.to_le_bytes());
         } else if mhod.mhod_type == 53 && mhod.raw_bytes.len() >= 52 {
-            // Increment num_entries of the last jump-table entry (at raw_bytes.len() - 4)
-            let len = mhod.raw_bytes.len();
-            let last_count = u32::from_le_bytes([
-                mhod.raw_bytes[len - 4],
-                mhod.raw_bytes[len - 3],
-                mhod.raw_bytes[len - 2],
-                mhod.raw_bytes[len - 1],
+            let sort_type = u32::from_le_bytes([
+                mhod.raw_bytes[24],
+                mhod.raw_bytes[25],
+                mhod.raw_bytes[26],
+                mhod.raw_bytes[27],
             ]);
-            mhod.raw_bytes[len - 4..len]
-                .copy_from_slice(&last_count.saturating_add(1).to_le_bytes());
+            let entry_count = u32::from_le_bytes([
+                mhod.raw_bytes[28],
+                mhod.raw_bytes[29],
+                mhod.raw_bytes[30],
+                mhod.raw_bytes[31],
+            ]) as usize;
+            let available = (mhod.raw_bytes.len() - 40) / 12;
+            let count = entry_count.min(available);
+
+            let mut entries: Vec<(u16, u16, u32, u32)> = Vec::with_capacity(count + 1);
+            for i in 0..count {
+                let off = 40 + i * 12;
+                let ch = u16::from_le_bytes([mhod.raw_bytes[off], mhod.raw_bytes[off + 1]]);
+                let pad = u16::from_le_bytes([mhod.raw_bytes[off + 2], mhod.raw_bytes[off + 3]]);
+                let start = u32::from_le_bytes([
+                    mhod.raw_bytes[off + 4],
+                    mhod.raw_bytes[off + 5],
+                    mhod.raw_bytes[off + 6],
+                    mhod.raw_bytes[off + 7],
+                ]);
+                let num = u32::from_le_bytes([
+                    mhod.raw_bytes[off + 8],
+                    mhod.raw_bytes[off + 9],
+                    mhod.raw_bytes[off + 10],
+                    mhod.raw_bytes[off + 11],
+                ]);
+                entries.push((ch, pad, start, num));
+            }
+
+            // Single catch-all '\0' entry (like sort_type 18 / 29 when no letter breakdown is used)
+            let is_single_catchall =
+                entries.len() == 1 && entries[0].0 == 0 && !matches!(sort_type, 3 | 4 | 5 | 7);
+
+            if is_single_catchall || new_track.is_none() {
+                if let Some(last) = entries.last_mut() {
+                    last.3 = last.3.saturating_add(1);
+                }
+            } else if let Some(nt) = new_track {
+                let (letter, rank) = jump_table_letter_and_rank(nt.primary_str(sort_type));
+                if let Some(existing_pos) = entries.iter().position(|e| e.0 == letter) {
+                    entries[existing_pos].3 = entries[existing_pos].3.saturating_add(1);
+                    for e in &mut entries[existing_pos + 1..] {
+                        e.2 = e.2.saturating_add(1);
+                    }
+                } else {
+                    let ins_idx = entries
+                        .iter()
+                        .position(|e| letter_u16_to_rank(e.0) > rank)
+                        .unwrap_or(entries.len());
+                    let start = if ins_idx < entries.len() {
+                        entries[ins_idx].2
+                    } else {
+                        insert_positions_by_sort_type
+                            .get(&sort_type)
+                            .map(|&(pos, _)| pos as u32)
+                            .unwrap_or_else(|| {
+                                entries.last().map(|e| e.2 + e.3).unwrap_or(0)
+                            })
+                    };
+                    entries.insert(ins_idx, (letter, 0, start, 1));
+                    for e in &mut entries[ins_idx + 1..] {
+                        e.2 = e.2.saturating_add(1);
+                    }
+                }
+            }
+
+            mhod.raw_bytes.truncate(40);
+            mhod.raw_bytes.reserve(entries.len() * 12);
+            for &(ch, pad, start, num) in &entries {
+                mhod.raw_bytes.extend_from_slice(&ch.to_le_bytes());
+                mhod.raw_bytes.extend_from_slice(&pad.to_le_bytes());
+                mhod.raw_bytes.extend_from_slice(&start.to_le_bytes());
+                mhod.raw_bytes.extend_from_slice(&num.to_le_bytes());
+            }
+            let new_entry_count = entries.len() as u32;
+            let new_total_len = mhod.raw_bytes.len() as u32;
+            mhod.raw_bytes[8..12].copy_from_slice(&new_total_len.to_le_bytes());
+            mhod.raw_bytes[28..32].copy_from_slice(&new_entry_count.to_le_bytes());
         }
     }
 }
