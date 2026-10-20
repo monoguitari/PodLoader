@@ -1,0 +1,3 @@
+# Lossless iTunesDB Round-Trip and Play Counts Merging
+
+The `iTunesDB` parser retains unrecognized `mhod` chunks, Smart Playlist rules (`mhod` types 50/51), non-music datasets (`mhsd`), and untouched `mhit` header bytes as raw byte slices in its in-memory representation so they are preserved byte-for-byte on re-serialization. When loading a Device Library, PodLoader also reads `iPod_Control/iTunes/Play Counts` (if present), merges incremental play counts, last-played timestamps, bookmark positions, and on-device rating changes into the corresponding `Device Track` records, and removes the consumed `Play Counts` file on commit.
