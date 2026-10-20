@@ -1328,6 +1328,64 @@ fn recovers_from_mid_batch_interruption_with_rollback_or_commit_completed_tracks
 }
 
 #[test]
+fn recovers_from_first_track_io_error_with_rollback() {
+    let device_temp = TempDir::new().expect("create device temp dir");
+    let mount_path = device_temp.path().to_path_buf();
+    let adapter = FakeHardwareAdapter {
+        volumes: vec![MountedVolume {
+            mount_path: mount_path.clone(),
+            volume_name: "IPOD".to_string(),
+            total_bytes: 30_000_000_000,
+            free_bytes: 25_000_000_000,
+            usb_firewire_guid: Some("000A270055667788".to_string()),
+        }],
+    };
+    let mut engine = PodLoaderEngine::new(adapter);
+    engine
+        .initialize_device(&mount_path, "Classic")
+        .expect("init device");
+
+    let host_temp = TempDir::new().expect("create host temp");
+    let t1_path = host_temp.path().join("01 - Transient Song.mp3");
+    fs::write(
+        &t1_path,
+        build_id3v23_mp3_fixture("Transient Song", "Artist A", "Album A", 1, "Rock", 2001, 3),
+    )
+    .expect("write t1");
+
+    engine
+        .stage_host_paths(&[t1_path.clone()], None)
+        .expect("stage track");
+
+    // Delete source file before committing to trigger an I/O error on track 1
+    fs::remove_file(&t1_path).expect("remove source file");
+
+    let outcome = engine.commit_sync_batch().expect("commit with I/O error");
+    match outcome {
+        CommitOutcome::Interrupted(summary) => {
+            assert_eq!(
+                summary.completed_track_count, 0,
+                "first track failed so 0 completed"
+            );
+            assert_eq!(summary.remaining_track_count, 1);
+            assert!(
+                summary.reason.to_lowercase().contains("no such file")
+                    || summary.reason.to_lowercase().contains("os error"),
+                "reason should capture the I/O error: {}",
+                summary.reason
+            );
+        }
+        other => panic!("expected Interrupted outcome, got {:?}", other),
+    }
+
+    let rolled_back = engine
+        .resolve_interrupted_batch(InterruptedResolution::RollBack)
+        .expect("rollback interrupted batch");
+    assert!(rolled_back.library.tracks.is_empty());
+    assert_eq!(rolled_back.sync_batch.additions.len(), 1);
+}
+
+#[test]
 fn updates_master_playlist_index_mhods_mhsd_type3_and_re_signs_extracted_hash72() {
     use podloader_core::signing::{
         compute_itunesdb_sha1_for_hash72, extract_hash72_params, generate_hash72,

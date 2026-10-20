@@ -44,7 +44,7 @@ pub fn parse_sysinfo(sysinfo_path: &Path) -> (Option<String>, Option<String>) {
                     }
                 }
             }
-            // Check HashInfo binary file (bytes 6..22 hold the 16-byte ASCII hex UUID)
+            // Check HashInfo binary file (bytes 6..22 hold the 16-byte ASCII hex FireWire GUID)
             if guid.is_none() {
                 let hash_info_path = device_dir.join("HashInfo");
                 if let Ok(bytes) = fs::read(&hash_info_path) {

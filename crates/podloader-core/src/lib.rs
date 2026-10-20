@@ -258,6 +258,15 @@ pub struct DeviceTrack {
     pub obfuscated_path: String,
 }
 
+impl DeviceTrack {
+    pub fn matches_host_file(&self, host_file: &HostFile) -> bool {
+        normalize_tag_key(&self.artist) == normalize_tag_key(&host_file.artist)
+            && normalize_tag_key(&self.album) == normalize_tag_key(&host_file.album)
+            && normalize_tag_key(&self.title) == normalize_tag_key(&host_file.title)
+            && self.track_number == host_file.track_number
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PlaylistKind {
@@ -494,12 +503,11 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
             if !is_native_ipod_format(&hf.format) {
                 continue;
             }
-            let matched = current.library.tracks.iter().find(|dt| {
-                normalize_tag_key(&dt.artist) == normalize_tag_key(&hf.artist)
-                    && normalize_tag_key(&dt.album) == normalize_tag_key(&hf.album)
-                    && normalize_tag_key(&dt.title) == normalize_tag_key(&hf.title)
-                    && dt.track_number == hf.track_number
-            });
+            let matched = current
+                .library
+                .tracks
+                .iter()
+                .find(|dt| dt.matches_host_file(&hf));
             let is_duplicate = matched.is_some();
             let staged_id = st.next_staged_id;
             st.next_staged_id += 1;
@@ -615,11 +623,11 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
                 fs::create_dir_all(parent)?;
             }
             if let Err(err) = copy_file_bytes(&item.host_file.path, &disk_path) {
-                if !completed_staged_ids.is_empty() {
-                    interruption_reason = Some(err.to_string());
-                    break;
+                if disk_path.is_file() {
+                    created_disk_paths.push(disk_path);
                 }
-                return Err(PodLoaderError::Io(err));
+                interruption_reason = Some(err.to_string());
+                break;
             }
 
             let replace_id = if item.is_duplicate
@@ -863,21 +871,17 @@ fn finalize_itunesdb_commit(
 
     fs::write(&bak_path, original_db_bytes)?;
 
-    if let Some(guid) = firewire_guid {
+    if firewire_guid.is_some() {
         parsed_db.ensure_mhbd_header_min_len(244);
-        let mut new_db_bytes = parsed_db.to_bytes();
-        if let Some((iv, rand12)) = extracted_72 {
-            resign_itunesdb_hash72_with_params(&mut new_db_bytes, &iv, &rand12);
-        }
-        sign_itunesdb(&mut new_db_bytes, guid)?;
-        atomic_write_file(&itunesdb_path, &new_db_bytes)?;
-    } else {
-        let mut new_db_bytes = parsed_db.to_bytes();
-        if let Some((iv, rand12)) = extracted_72 {
-            resign_itunesdb_hash72_with_params(&mut new_db_bytes, &iv, &rand12);
-        }
-        atomic_write_file(&itunesdb_path, &new_db_bytes)?;
     }
+    let mut new_db_bytes = parsed_db.to_bytes();
+    if let Some((iv, rand12)) = extracted_72 {
+        resign_itunesdb_hash72_with_params(&mut new_db_bytes, &iv, &rand12);
+    }
+    if let Some(guid) = firewire_guid {
+        sign_itunesdb(&mut new_db_bytes, guid)?;
+    }
+    atomic_write_file(&itunesdb_path, &new_db_bytes)?;
 
     if play_counts_path.is_file() {
         let _ = fs::remove_file(&play_counts_path);

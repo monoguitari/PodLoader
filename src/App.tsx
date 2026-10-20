@@ -589,12 +589,16 @@ export function App({ bridge }: AppProps) {
                 <button type="button" onClick={() => handleCommitBatch()}>
                   Commit Sync Batch
                 </button>
-                <button
-                  type="button"
-                  onClick={() => handleCommitBatch(1)}
-                >
-                  Pause After First Track
-                </button>
+                {import.meta.env.DEV && (
+                  <button
+                    type="button"
+                    className="dev-only-button"
+                    title="Developer test trigger: simulate mid-batch pause"
+                    onClick={() => handleCommitBatch(1)}
+                  >
+                    Pause After First Track
+                  </button>
+                )}
               </div>
             </section>
           )}
