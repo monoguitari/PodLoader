@@ -11,6 +11,7 @@ import type {
   PodLoaderBridge,
   SyncBatch,
   TranscodePreset,
+  TransferProgress,
 } from "./bridge";
 
 declare global {
@@ -115,6 +116,7 @@ const defaultBridge: PodLoaderBridge = {
   },
   async commitSyncBatch(options?: {
     maxTracksBeforeInterrupt?: number;
+    onProgress?: (progress: TransferProgress) => void;
   }): Promise<CommitOutcome> {
     if (window.__TAURI_INTERNALS__) {
       return window.__TAURI_INTERNALS__.invoke<CommitOutcome>(
@@ -122,7 +124,52 @@ const defaultBridge: PodLoaderBridge = {
         options ?? {},
       );
     }
-    return postJson<CommitOutcome>("/api/commit_sync_batch", options ?? {});
+    const res = await fetch("http://127.0.0.1:41731/api/commit_sync_batch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(options ?? {}),
+    });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+    }
+    if (!res.body) {
+      return res.json() as Promise<CommitOutcome>;
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let finalOutcome: CommitOutcome | null = null;
+    let finalError: string | null = null;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const msg = JSON.parse(line);
+          if (msg.type === "progress" && options?.onProgress) {
+            options.onProgress(msg.data);
+          } else if (msg.type === "outcome") {
+            finalOutcome = msg.data;
+          } else if (msg.type === "error") {
+            finalError = msg.error;
+          }
+        } catch {
+          // Ignore unparseable chunks
+        }
+      }
+    }
+    if (finalError) {
+      throw new Error(finalError);
+    }
+    if (finalOutcome) {
+      return finalOutcome;
+    }
+    throw new Error("No outcome received from commit");
   },
   async resolveInterruptedBatch(
     resolution: InterruptedResolution,

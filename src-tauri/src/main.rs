@@ -220,10 +220,21 @@ fn handle_http_client(mut stream: std::net::TcpStream, state: &AppState) -> std:
         let limit = parsed["maxTracksBeforeInterrupt"]
             .as_u64()
             .map(|n| n as usize);
-        match state.commit_sync_batch(limit) {
-            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
-            Err(e) => serde_json::json!({ "error": e }).to_string(),
-        }
+        let header = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
+        stream.write_all(header.as_bytes())?;
+        let outcome = state.commit_sync_batch_with_progress(limit, |prog| {
+            let line = serde_json::json!({ "type": "progress", "data": prog }).to_string() + "\n";
+            let _ = stream.write_all(line.as_bytes());
+            let _ = stream.flush();
+        });
+        let outcome_json = match outcome {
+            Ok(res) => serde_json::json!({ "type": "outcome", "data": res }),
+            Err(e) => serde_json::json!({ "type": "error", "error": e }),
+        };
+        let line = outcome_json.to_string() + "\n";
+        let _ = stream.write_all(line.as_bytes());
+        stream.flush()?;
+        return Ok(());
     } else if first_line.starts_with("POST /api/resolve_interrupted_batch") {
         let resolution: InterruptedResolution =
             serde_json::from_value(parsed["resolution"].clone())

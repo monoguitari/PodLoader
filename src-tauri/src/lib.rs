@@ -75,9 +75,20 @@ impl<A: HardwareDeviceAdapter> AppState<A> {
         &self,
         max_tracks_before_interrupt: Option<usize>,
     ) -> Result<CommitOutcome, String> {
+        self.commit_sync_batch_with_progress(max_tracks_before_interrupt, |_| {})
+    }
+
+    pub fn commit_sync_batch_with_progress<F>(
+        &self,
+        max_tracks_before_interrupt: Option<usize>,
+        on_progress: F,
+    ) -> Result<CommitOutcome, String>
+    where
+        F: FnMut(podloader_core::TransferProgress),
+    {
         let mut guard = self.engine.lock().map_err(|e| e.to_string())?;
         guard
-            .commit_sync_batch_with_limit(max_tracks_before_interrupt)
+            .commit_sync_batch_with_progress(max_tracks_before_interrupt, on_progress)
             .map_err(|e| e.to_string())
     }
 

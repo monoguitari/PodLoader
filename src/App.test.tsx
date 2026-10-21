@@ -207,6 +207,16 @@ class InMemoryPodLoaderBridge implements PodLoaderBridge {
       }
 
       const newId = 500 + item.stagedId;
+      const targetPreset = item.targetFormat ?? session.transcodePreset ?? "alac";
+      const ext = item.requiresTranscode
+        ? targetPreset === "mp3"
+          ? "mp3"
+          : "m4a"
+        : item.hostFile.format.toLowerCase() === "wav"
+          ? "wav"
+          : item.hostFile.format.toLowerCase() === "m4a"
+            ? "m4a"
+            : "mp3";
       session.library.tracks.push({
         id: newId,
         title: item.hostFile.title,
@@ -221,7 +231,7 @@ class InMemoryPodLoaderBridge implements PodLoaderBridge {
         playCount: 0,
         rating: 0,
         bookmarkMs: 0,
-        obfuscatedPath: `:iPod_Control:Music:F00:T${item.stagedId}.mp3`,
+        obfuscatedPath: `:iPod_Control:Music:F00:T${item.stagedId}.${ext}`,
       });
       for (const pl of session.library.playlists) {
         if (pl.kind === "master" || pl.id === item.targetPlaylistId) {
@@ -844,5 +854,16 @@ describe("PodLoaderBridge React UI Seam", () => {
       await within(deviceTable).findByText("Everything In Its Right Place"),
     ).toBeInTheDocument();
     expect(within(deviceTable).getAllByText("Kid A")).toHaveLength(4);
+
+    // Verify transcoded FLAC and OGG tracks were assigned .m4a container paths on the Device
+    if (bridge.state.status === "connected") {
+      const addedTracks = bridge.state.data.library.tracks;
+      const flacTranscoded = addedTracks.find(
+        (t) => t.title === "Everything In Its Right Place",
+      );
+      const oggTranscoded = addedTracks.find((t) => t.title === "Kid A");
+      expect(flacTranscoded?.obfuscatedPath).toMatch(/\.m4a$/);
+      expect(oggTranscoded?.obfuscatedPath).toMatch(/\.m4a$/);
+    }
   });
 });

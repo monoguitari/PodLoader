@@ -118,7 +118,11 @@ pub trait HardwareDeviceAdapter: Send + Sync {
         let codec_args: &[&str] = match preset {
             TranscodePreset::Aac => &["-vn", "-c:a", "aac", "-b:a", "256k"],
             TranscodePreset::Mp3 => &["-vn", "-c:a", "libmp3lame", "-b:a", "256k"],
-            TranscodePreset::Alac => &["-vn", "-c:a", "alac"],
+            TranscodePreset::Alac => {
+                return Err(PodLoaderError::TranscodeFailed(
+                    "Lossless ALAC is transcoded via pure-Rust pipeline".into(),
+                ));
+            }
         };
         let status = std::process::Command::new("ffmpeg")
             .arg("-y")
@@ -818,11 +822,28 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
                         .transcode_lossy(&item.host_file.path, &disk_path, preset, &item.host_file)
                         .and_then(|()| {
                             let written_size = fs::metadata(&disk_path)?.len();
+                            let meta = transcode::inspect_symphonia_metadata(&disk_path, written_size)
+                                .unwrap_or_default();
+                            let dur = if meta.duration_ms > 0 {
+                                meta.duration_ms
+                            } else {
+                                item.host_file.duration_ms.max(1000)
+                            };
+                            let br = if meta.bitrate_kbps > 0 {
+                                meta.bitrate_kbps
+                            } else {
+                                ((written_size * 8) / (dur as u64)).max(32) as u32
+                            };
+                            let sr = if meta.sample_rate > 0 {
+                                meta.sample_rate
+                            } else {
+                                44_100
+                            };
                             Ok(transcode::TranscodedOutputInfo {
                                 file_size: written_size,
-                                duration_ms: item.host_file.duration_ms.max(1000),
-                                bitrate_kbps: 256,
-                                sample_rate: 44_100,
+                                duration_ms: dur,
+                                bitrate_kbps: br,
+                                sample_rate: sr,
                             })
                         }),
                 };

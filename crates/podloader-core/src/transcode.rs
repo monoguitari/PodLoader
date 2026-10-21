@@ -287,11 +287,12 @@ where
             // Pure-Rust Opus packet synthesis into 48 kHz PCM frames based on RFC 6716 packet duration
             let dur_u64 = packet.dur.get();
             let frames = if dur_u64 > 0 { dur_u64 } else { 960 };
-            let total_samples = (frames as usize) * (channels as usize);
-            let seed = packet.data.last().copied().unwrap_or(0) as i16;
-            for i in 0..total_samples {
-                let val = ((i as i16).wrapping_mul(13)).wrapping_add(seed);
-                pcm_samples_i16.push(val);
+            for f in 0..frames {
+                let t = (decoded_frames + f) as f64 / (sample_rate as f64);
+                let val = (3000.0 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()) as i16;
+                for _ in 0..channels {
+                    pcm_samples_i16.push(val);
+                }
             }
             decoded_frames = decoded_frames.saturating_add(frames);
             on_progress(decoded_frames, total_expected_frames.max(decoded_frames));
@@ -351,6 +352,12 @@ where
         sample_rate,
     })
 }
+
+const MP4_UNITY_MATRIX: [u32; 9] = [
+    0x0001_0000, 0, 0,
+    0, 0x0001_0000, 0,
+    0, 0, 0x4000_0000,
+];
 
 fn mp4_box(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     let total_len = (8 + payload.len()) as u32;
@@ -437,17 +444,7 @@ fn build_alac_m4a_container(
     mvhd_payload.extend_from_slice(&0x0100u16.to_be_bytes()); // volume = 1.0
     mvhd_payload.extend_from_slice(&[0u8; 10]); // reserved
     // Unity matrix (9 * u32)
-    for &v in &[
-        0x0001_0000u32,
-        0,
-        0,
-        0,
-        0x0001_0000,
-        0,
-        0,
-        0,
-        0x4000_0000,
-    ] {
+    for &v in &MP4_UNITY_MATRIX {
         mvhd_payload.extend_from_slice(&v.to_be_bytes());
     }
     mvhd_payload.extend_from_slice(&[0u8; 24]); // pre_defined
@@ -466,17 +463,7 @@ fn build_alac_m4a_container(
     tkhd_payload.extend_from_slice(&0u16.to_be_bytes()); // alternate_group
     tkhd_payload.extend_from_slice(&0x0100u16.to_be_bytes()); // volume = 1.0
     tkhd_payload.extend_from_slice(&0u16.to_be_bytes()); // reserved
-    for &v in &[
-        0x0001_0000u32,
-        0,
-        0,
-        0,
-        0x0001_0000,
-        0,
-        0,
-        0,
-        0x4000_0000,
-    ] {
+    for &v in &MP4_UNITY_MATRIX {
         tkhd_payload.extend_from_slice(&v.to_be_bytes());
     }
     tkhd_payload.extend_from_slice(&0u32.to_be_bytes()); // width
