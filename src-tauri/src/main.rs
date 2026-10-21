@@ -335,6 +335,86 @@ fn handle_http_client(mut stream: std::net::TcpStream, state: &AppState) -> std:
             Ok(()) => serde_json::json!({ "status": "ok" }).to_string(),
             Err(e) => serde_json::json!({ "error": e }).to_string(),
         }
+    } else if first_line.starts_with("POST /api/stage_orphan_recovery") {
+        let obfuscated_path = parsed["obfuscatedPath"].as_str().unwrap_or("");
+        match state.stage_orphan_recovery(obfuscated_path) {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("POST /api/stage_orphan_deletion") {
+        let obfuscated_path = parsed["obfuscatedPath"].as_str().unwrap_or("");
+        match state.stage_orphan_deletion(obfuscated_path) {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("POST /api/export_device_tracks") {
+        let track_ids: Vec<u32> = parsed["trackIds"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect())
+            .unwrap_or_default();
+        let destination_dir = parsed["destinationDir"].as_str().unwrap_or(".");
+        match state.export_device_tracks(track_ids, destination_dir) {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("POST /api/export_device_playlist") {
+        let playlist_id = parsed["playlistId"].as_u64().unwrap_or(0);
+        let destination_dir = parsed["destinationDir"].as_str().unwrap_or(".");
+        match state.export_device_playlist(playlist_id, destination_dir) {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("POST /api/eject_device") {
+        let force = parsed["force"].as_bool().unwrap_or(false);
+        match state.eject_device(force) {
+            Ok(()) => serde_json::json!({ "status": "ok" }).to_string(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("POST /api/play_host_file") {
+        let host_file: podloader_core::HostFile =
+            serde_json::from_value(parsed["hostFile"].clone()).unwrap_or_default();
+        match state.play_host_file(host_file) {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("POST /api/play_device_track") {
+        let track_id = parsed["trackId"].as_u64().unwrap_or(0) as u32;
+        match state.play_device_track(track_id) {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("POST /api/pause_playback") {
+        match state.pause_playback() {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("POST /api/resume_playback") {
+        match state.resume_playback() {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("POST /api/stop_playback") {
+        match state.stop_playback() {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("POST /api/seek_playback") {
+        let position_ms = parsed["positionMs"].as_u64().unwrap_or(0) as u32;
+        match state.seek_playback(position_ms) {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("POST /api/set_playback_volume") {
+        let volume = parsed["volume"].as_f64().unwrap_or(1.0) as f32;
+        match state.set_playback_volume(volume) {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("GET /api/get_playback_status") {
+        match state.get_playback_status() {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
     } else {
         serde_json::json!({ "status": "ok" }).to_string()
     };

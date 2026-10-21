@@ -1,5 +1,6 @@
 //! Core domain engine for PodLoader (`ADR-0001`, `ADR-0004`, `ADR-0006`).
 
+pub mod audio;
 pub mod host;
 pub mod itunesdb;
 pub mod playcounts;
@@ -7,6 +8,11 @@ pub mod signing;
 pub mod sysinfo;
 pub mod tagging;
 pub mod transcode;
+
+pub use crate::audio::{
+    ActivePlaybackTrack, AudioSinkAdapter, AudioSourceKind, HeadlessAudioSinkAdapter,
+    PlaybackState, PlaybackStatus,
+};
 
 use std::cell::RefCell;
 use std::fs;
@@ -16,7 +22,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::host::{
-    collect_host_files_from_paths, is_native_ipod_format, is_transcodable_format,
+    collect_host_files_from_paths, is_native_ipod_format, is_supported_audio_path,
+    is_transcodable_format,
 };
 use crate::itunesdb::{build_empty_itunesdb, ItunesDb};
 use crate::playcounts::{merge_play_counts_into_tracks, parse_play_counts};
@@ -56,6 +63,8 @@ pub enum PodLoaderError {
     TranscodeFailed(String),
     #[error("Device operation failed: {0}")]
     DeviceOperationFailed(String),
+    #[error("Uncommitted changes are pending in the Sync Batch")]
+    UncommittedChangesPending,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,7 +74,7 @@ pub struct HostDirectoryEntry {
     pub path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostFile {
     pub path: PathBuf,
@@ -156,6 +165,10 @@ pub trait HardwareDeviceAdapter: Send + Sync {
         }
         Ok(())
     }
+
+    fn eject_volume(&self, _mount_path: &Path) -> Result<(), PodLoaderError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -213,6 +226,35 @@ impl HardwareDeviceAdapter for SystemHardwareDeviceAdapter {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    fn eject_volume(&self, mount_path: &Path) -> Result<(), PodLoaderError> {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = std::process::Command::new("sync").status();
+            let _ = std::process::Command::new("eject").arg(mount_path).status();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("sync").status();
+            let _ = std::process::Command::new("diskutil")
+                .args(["eject", &mount_path.to_string_lossy()])
+                .status();
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    &format!(
+                        "(New-Object -comObject Shell.Application).Namespace(17).ParseName('{}').InvokeVerb('Eject')",
+                        mount_path.to_string_lossy()
+                    ),
+                ])
+                .status();
+        }
+        Ok(())
     }
 }
 
@@ -432,6 +474,39 @@ pub struct StagedTrackRemoval {
     pub track_artist: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrphanFile {
+    pub path: PathBuf,
+    pub obfuscated_path: String,
+    pub file_name: String,
+    pub file_size: u64,
+    pub format: String,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub track_number: u32,
+    pub disc_number: u32,
+    pub genre: String,
+    pub year: u32,
+    pub duration_ms: u32,
+    pub bitrate_kbps: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StagedOrphanRecovery {
+    pub staged_id: u64,
+    pub orphan_file: OrphanFile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StagedOrphanDeletion {
+    pub staged_id: u64,
+    pub orphan_file: OrphanFile,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncBatch {
@@ -440,6 +515,10 @@ pub struct SyncBatch {
     pub edits: Vec<StagedMetadataEdit>,
     #[serde(default)]
     pub removals: Vec<StagedTrackRemoval>,
+    #[serde(default)]
+    pub orphan_recoveries: Vec<StagedOrphanRecovery>,
+    #[serde(default)]
+    pub orphan_deletions: Vec<StagedOrphanDeletion>,
     pub required_bytes: u64,
 }
 
@@ -487,6 +566,8 @@ pub struct DeviceSession {
     pub interrupted_batch: Option<InterruptedBatchSummary>,
     pub transcode_preset: TranscodePreset,
     pub ffmpeg_available: bool,
+    #[serde(default)]
+    pub orphan_files: Vec<OrphanFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -495,6 +576,13 @@ pub enum DeviceConnectionState {
     Disconnected,
     UninitializedVolume(MountedVolume),
     Connected(DeviceSession),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportResult {
+    pub exported_count: usize,
+    pub exported_files: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -517,17 +605,28 @@ struct EngineState {
     next_obfuscated_counter: u64,
     interrupted_journal: Option<InterruptedJournal>,
     transcode_preset: TranscodePreset,
+    ejected_mount_paths: Vec<PathBuf>,
 }
 
-pub struct PodLoaderEngine<A: HardwareDeviceAdapter> {
+pub struct PodLoaderEngine<A: HardwareDeviceAdapter, S: AudioSinkAdapter = HeadlessAudioSinkAdapter> {
     adapter: A,
+    audio_sink: RefCell<S>,
+    active_track: RefCell<Option<ActivePlaybackTrack>>,
     state: RefCell<EngineState>,
 }
 
-impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
+impl<A: HardwareDeviceAdapter> PodLoaderEngine<A, HeadlessAudioSinkAdapter> {
     pub fn new(adapter: A) -> Self {
+        Self::new_with_audio_sink(adapter, HeadlessAudioSinkAdapter::default())
+    }
+}
+
+impl<A: HardwareDeviceAdapter, S: AudioSinkAdapter> PodLoaderEngine<A, S> {
+    pub fn new_with_audio_sink(adapter: A, audio_sink: S) -> Self {
         Self {
             adapter,
+            audio_sink: RefCell::new(audio_sink),
+            active_track: RefCell::new(None),
             state: RefCell::new(EngineState {
                 active_mount_path: None,
                 sync_batch: SyncBatch::default(),
@@ -535,16 +634,23 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
                 next_obfuscated_counter: 1,
                 interrupted_journal: None,
                 transcode_preset: TranscodePreset::Alac,
+                ejected_mount_paths: Vec::new(),
             }),
         }
     }
 
     pub fn scan_device(&self) -> Result<DeviceConnectionState, PodLoaderError> {
         let volumes = self.adapter.list_mounted_volumes()?;
-        let Some(vol) = volumes.into_iter().next() else {
+        let st = self.state.borrow();
+        let Some(vol) = volumes
+            .into_iter()
+            .find(|v| !st.ejected_mount_paths.contains(&v.mount_path))
+        else {
+            drop(st);
             self.state.borrow_mut().active_mount_path = None;
             return Ok(DeviceConnectionState::Disconnected);
         };
+        drop(st);
 
         let itunesdb_path = vol
             .mount_path
@@ -565,6 +671,11 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
         mount_path: &Path,
         device_name: &str,
     ) -> Result<DeviceConnectionState, PodLoaderError> {
+        self.state
+            .borrow_mut()
+            .ejected_mount_paths
+            .retain(|p| p != mount_path);
+
         let volumes = self.adapter.list_mounted_volumes()?;
         let vol = volumes
             .into_iter()
@@ -745,6 +856,86 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
                     });
                 }
             }
+        }
+        Ok(st.sync_batch.clone())
+    }
+
+    pub fn stage_orphan_recovery(
+        &mut self,
+        obfuscated_path: &str,
+    ) -> Result<SyncBatch, PodLoaderError> {
+        let current = match self.scan_device()? {
+            DeviceConnectionState::Connected(session) => session,
+            _ => return Err(PodLoaderError::NoActiveDevice),
+        };
+        let orphan = current
+            .orphan_files
+            .iter()
+            .find(|o| o.obfuscated_path == obfuscated_path)
+            .ok_or_else(|| {
+                PodLoaderError::DeviceOperationFailed(format!(
+                    "Orphan file {} not found on device",
+                    obfuscated_path
+                ))
+            })?
+            .clone();
+
+        let mut st = self.state.borrow_mut();
+        st.sync_batch
+            .orphan_deletions
+            .retain(|d| d.orphan_file.obfuscated_path != obfuscated_path);
+        if !st
+            .sync_batch
+            .orphan_recoveries
+            .iter()
+            .any(|r| r.orphan_file.obfuscated_path == obfuscated_path)
+        {
+            let staged_id = st.next_staged_id;
+            st.next_staged_id += 1;
+            st.sync_batch.orphan_recoveries.push(StagedOrphanRecovery {
+                staged_id,
+                orphan_file: orphan,
+            });
+        }
+        Ok(st.sync_batch.clone())
+    }
+
+    pub fn stage_orphan_deletion(
+        &mut self,
+        obfuscated_path: &str,
+    ) -> Result<SyncBatch, PodLoaderError> {
+        let current = match self.scan_device()? {
+            DeviceConnectionState::Connected(session) => session,
+            _ => return Err(PodLoaderError::NoActiveDevice),
+        };
+        let orphan = current
+            .orphan_files
+            .iter()
+            .find(|o| o.obfuscated_path == obfuscated_path)
+            .ok_or_else(|| {
+                PodLoaderError::DeviceOperationFailed(format!(
+                    "Orphan file {} not found on device",
+                    obfuscated_path
+                ))
+            })?
+            .clone();
+
+        let mut st = self.state.borrow_mut();
+        st.sync_batch
+            .orphan_recoveries
+            .retain(|r| r.orphan_file.obfuscated_path != obfuscated_path);
+        if !st
+            .sync_batch
+            .orphan_deletions
+            .iter()
+            .any(|d| d.orphan_file.obfuscated_path == obfuscated_path)
+        {
+            let staged_id = st.next_staged_id;
+            st.next_staged_id += 1;
+            st.sync_batch.orphan_deletions.push(StagedOrphanDeletion {
+                staged_id,
+                orphan_file: orphan,
+            });
         }
         Ok(st.sync_batch.clone())
     }
@@ -1057,6 +1248,39 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
             }
         }
 
+        // Apply staged orphan recoveries into Master Playlist
+        let staged_recoveries = self.state.borrow().sync_batch.orphan_recoveries.clone();
+        for rec in &staged_recoveries {
+            let hf = HostFile {
+                path: rec.orphan_file.path.clone(),
+                file_name: rec.orphan_file.file_name.clone(),
+                format: rec.orphan_file.format.clone(),
+                file_size: rec.orphan_file.file_size,
+                title: rec.orphan_file.title.clone(),
+                artist: rec.orphan_file.artist.clone(),
+                album: rec.orphan_file.album.clone(),
+                track_number: rec.orphan_file.track_number,
+                disc_number: rec.orphan_file.disc_number,
+                genre: rec.orphan_file.genre.clone(),
+                year: rec.orphan_file.year,
+                duration_ms: rec.orphan_file.duration_ms,
+                bitrate_kbps: rec.orphan_file.bitrate_kbps,
+            };
+            parsed_db.upsert_transferred_track(
+                &hf,
+                &rec.orphan_file.obfuscated_path,
+                None,
+                None,
+                None,
+            );
+        }
+
+        // Apply staged orphan deletions
+        let staged_deletions = self.state.borrow().sync_batch.orphan_deletions.clone();
+        for del in &staged_deletions {
+            old_paths_to_remove.push(del.orphan_file.path.clone());
+        }
+
         finalize_itunesdb_commit(
             &mount_path,
             &original_db_bytes,
@@ -1216,6 +1440,8 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
             )
         };
 
+        let orphan_files = scan_orphan_files(&vol.mount_path, &library);
+
         Ok(DeviceConnectionState::Connected(DeviceSession {
             device: DeviceMetadata {
                 mount_path: vol.mount_path,
@@ -1232,6 +1458,7 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
             interrupted_batch,
             transcode_preset,
             ffmpeg_available: self.adapter.is_ffmpeg_available(),
+            orphan_files,
         }))
     }
 
@@ -1301,6 +1528,217 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
     pub fn delete_device_playlist(&mut self, playlist_id: u64) -> Result<(), PodLoaderError> {
         self.mutate_itunesdb(|db| db.delete_device_playlist(playlist_id))
     }
+
+    pub fn export_device_tracks(
+        &self,
+        track_ids: &[u32],
+        destination_dir: &Path,
+    ) -> Result<ExportResult, PodLoaderError> {
+        let current = match self.scan_device()? {
+            DeviceConnectionState::Connected(session) => session,
+            _ => return Err(PodLoaderError::NoActiveDevice),
+        };
+        let mut exported_files = Vec::new();
+        for &tid in track_ids {
+            let Some(track) = current.library.tracks.iter().find(|t| t.id == tid) else {
+                continue;
+            };
+            let source_disk_path =
+                obfuscated_to_disk_path(&current.device.mount_path, &track.obfuscated_path);
+            if !source_disk_path.is_file() {
+                continue;
+            }
+            let ext = source_disk_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("mp3");
+            let artist_dir = sanitize_filename_segment(&track.artist);
+            let album_dir = sanitize_filename_segment(&track.album);
+            let title_part = sanitize_filename_segment(&track.title);
+            let file_name = format!("{:02} - {}.{}", track.track_number, title_part, ext);
+            let target_dir = destination_dir.join(&artist_dir).join(&album_dir);
+            fs::create_dir_all(&target_dir)?;
+            let target_path = target_dir.join(&file_name);
+            copy_file_bytes(&source_disk_path, &target_path)?;
+            exported_files.push(target_path);
+        }
+        Ok(ExportResult {
+            exported_count: exported_files.len(),
+            exported_files,
+        })
+    }
+
+    pub fn export_device_playlist(
+        &self,
+        playlist_id: u64,
+        destination_dir: &Path,
+    ) -> Result<ExportResult, PodLoaderError> {
+        let current = match self.scan_device()? {
+            DeviceConnectionState::Connected(session) => session,
+            _ => return Err(PodLoaderError::NoActiveDevice),
+        };
+        let Some(playlist) = current
+            .library
+            .playlists
+            .iter()
+            .find(|p| p.id == playlist_id)
+        else {
+            return Err(PodLoaderError::DeviceOperationFailed(format!(
+                "Playlist {} not found",
+                playlist_id
+            )));
+        };
+        self.export_device_tracks(&playlist.track_ids, destination_dir)
+    }
+
+    pub fn has_uncommitted_changes(&self) -> bool {
+        let st = self.state.borrow();
+        st.sync_batch.additions.iter().any(|a| a.should_transfer())
+            || !st.sync_batch.edits.is_empty()
+            || !st.sync_batch.removals.is_empty()
+            || !st.sync_batch.orphan_recoveries.is_empty()
+            || !st.sync_batch.orphan_deletions.is_empty()
+    }
+
+    pub fn eject_device(&mut self, force: bool) -> Result<(), PodLoaderError> {
+        let current = match self.scan_device()? {
+            DeviceConnectionState::Connected(session) => session,
+            _ => return Err(PodLoaderError::NoActiveDevice),
+        };
+        if !force && self.has_uncommitted_changes() {
+            return Err(PodLoaderError::UncommittedChangesPending);
+        }
+        let is_device_playing = self
+            .active_track
+            .borrow()
+            .as_ref()
+            .map(|a| a.source_kind == AudioSourceKind::Device)
+            .unwrap_or(false);
+        if is_device_playing {
+            let _ = self.stop_playback();
+        }
+        let mount_path = current.device.mount_path.clone();
+        self.adapter.eject_volume(&mount_path)?;
+
+        let mut st = self.state.borrow_mut();
+        st.ejected_mount_paths.push(mount_path);
+        st.active_mount_path = None;
+        st.sync_batch = SyncBatch::default();
+        st.interrupted_journal = None;
+        Ok(())
+    }
+
+    pub fn get_playback_status(&self) -> PlaybackStatus {
+        let sink = self.audio_sink.borrow();
+        let track = self.active_track.borrow().clone();
+        let state = if sink.is_playing() {
+            PlaybackState::Playing
+        } else if sink.is_paused() && track.is_some() {
+            PlaybackState::Paused
+        } else {
+            PlaybackState::Stopped
+        };
+        let elapsed_ms = sink.get_position_ms();
+        let duration_ms = track.as_ref().map(|t| t.duration_ms).unwrap_or(0);
+        let volume = sink.get_volume();
+        PlaybackStatus {
+            state,
+            track,
+            elapsed_ms,
+            duration_ms,
+            volume,
+        }
+    }
+
+    pub fn play_host_file(&self, host_file: &HostFile) -> Result<PlaybackStatus, PodLoaderError> {
+        let mut sink = self.audio_sink.borrow_mut();
+        let dur = sink.play_source(&host_file.path, 0)?;
+        let active = ActivePlaybackTrack {
+            source_kind: AudioSourceKind::Host,
+            source_path: host_file.path.clone(),
+            title: host_file.title.clone(),
+            artist: host_file.artist.clone(),
+            album: host_file.album.clone(),
+            duration_ms: if dur > 0 { dur } else { host_file.duration_ms },
+            track_id: None,
+        };
+        *self.active_track.borrow_mut() = Some(active.clone());
+        Ok(PlaybackStatus {
+            state: PlaybackState::Playing,
+            track: Some(active),
+            elapsed_ms: 0,
+            duration_ms: dur,
+            volume: sink.get_volume(),
+        })
+    }
+
+    pub fn play_device_track(&self, track_id: u32) -> Result<PlaybackStatus, PodLoaderError> {
+        let current = match self.scan_device()? {
+            DeviceConnectionState::Connected(session) => session,
+            _ => return Err(PodLoaderError::NoActiveDevice),
+        };
+        let track = current
+            .library
+            .tracks
+            .iter()
+            .find(|t| t.id == track_id)
+            .ok_or_else(|| {
+                PodLoaderError::DeviceOperationFailed(format!("Track {} not found", track_id))
+            })?;
+        let disk_path =
+            obfuscated_to_disk_path(&current.device.mount_path, &track.obfuscated_path);
+        if !disk_path.is_file() {
+            return Err(PodLoaderError::DeviceOperationFailed(format!(
+                "Audio file at {:?} not found",
+                disk_path
+            )));
+        }
+        let mut sink = self.audio_sink.borrow_mut();
+        let dur = sink.play_source(&disk_path, 0)?;
+        let active = ActivePlaybackTrack {
+            source_kind: AudioSourceKind::Device,
+            source_path: disk_path,
+            title: track.title.clone(),
+            artist: track.artist.clone(),
+            album: track.album.clone(),
+            duration_ms: if dur > 0 { dur } else { track.duration_ms },
+            track_id: Some(track_id),
+        };
+        *self.active_track.borrow_mut() = Some(active.clone());
+        Ok(PlaybackStatus {
+            state: PlaybackState::Playing,
+            track: Some(active),
+            elapsed_ms: 0,
+            duration_ms: dur,
+            volume: sink.get_volume(),
+        })
+    }
+
+    pub fn pause_playback(&self) -> Result<PlaybackStatus, PodLoaderError> {
+        self.audio_sink.borrow_mut().pause()?;
+        Ok(self.get_playback_status())
+    }
+
+    pub fn resume_playback(&self) -> Result<PlaybackStatus, PodLoaderError> {
+        self.audio_sink.borrow_mut().resume()?;
+        Ok(self.get_playback_status())
+    }
+
+    pub fn stop_playback(&self) -> Result<PlaybackStatus, PodLoaderError> {
+        self.audio_sink.borrow_mut().stop()?;
+        *self.active_track.borrow_mut() = None;
+        Ok(self.get_playback_status())
+    }
+
+    pub fn seek_playback(&self, position_ms: u32) -> Result<PlaybackStatus, PodLoaderError> {
+        self.audio_sink.borrow_mut().seek(position_ms)?;
+        Ok(self.get_playback_status())
+    }
+
+    pub fn set_playback_volume(&self, volume: f32) -> Result<PlaybackStatus, PodLoaderError> {
+        self.audio_sink.borrow_mut().set_volume(volume)?;
+        Ok(self.get_playback_status())
+    }
 }
 
 fn finalize_itunesdb_commit(
@@ -1344,6 +1782,69 @@ fn finalize_itunesdb_commit(
         }
     }
     Ok(())
+}
+
+pub fn scan_orphan_files(mount_path: &Path, library: &DeviceLibrary) -> Vec<OrphanFile> {
+    let music_root = mount_path.join("iPod_Control").join("Music");
+    if !music_root.is_dir() {
+        return Vec::new();
+    }
+    let mut orphans = Vec::new();
+    for idx in 0..50 {
+        let folder_name = format!("F{:02}", idx);
+        let folder_path = music_root.join(&folder_name);
+        if let Ok(entries) = fs::read_dir(&folder_path) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && is_supported_audio_path(&path) {
+                    let file_name = entry.file_name().to_string_lossy().to_string();
+                    let obfuscated_path = format!(":iPod_Control:Music:{}:{}", folder_name, file_name);
+                    let is_indexed = library
+                        .tracks
+                        .iter()
+                        .any(|t| t.obfuscated_path.eq_ignore_ascii_case(&obfuscated_path));
+                    if !is_indexed {
+                        if let Ok(hf) = host::inspect_host_file(&path) {
+                            orphans.push(OrphanFile {
+                                path,
+                                obfuscated_path,
+                                file_name: hf.file_name,
+                                file_size: hf.file_size,
+                                format: hf.format,
+                                title: hf.title,
+                                artist: hf.artist,
+                                album: hf.album,
+                                track_number: hf.track_number,
+                                disc_number: hf.disc_number,
+                                genre: hf.genre,
+                                year: hf.year,
+                                duration_ms: hf.duration_ms,
+                                bitrate_kbps: hf.bitrate_kbps,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    orphans.sort_by(|a, b| a.obfuscated_path.cmp(&b.obfuscated_path));
+    orphans
+}
+
+pub fn sanitize_filename_segment(val: &str) -> String {
+    let sanitized: String = val
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            other => other,
+        })
+        .collect();
+    let trimmed = sanitized.trim().trim_matches('.').trim();
+    if trimmed.is_empty() {
+        "Unknown".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn normalize_tag_key(val: &str) -> String {

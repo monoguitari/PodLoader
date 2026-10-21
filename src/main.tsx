@@ -7,8 +7,11 @@ import type {
   DevicePlaylist,
   DeviceSession,
   DuplicateResolution,
+  ExportResult,
   HostDirectoryListing,
+  HostFile,
   InterruptedResolution,
+  PlaybackStatus,
   PodLoaderBridge,
   SyncBatch,
   TrackMetadataEdits,
@@ -301,6 +304,136 @@ const defaultBridge: PodLoaderBridge = {
       );
     }
     return postJson<void>("/api/delete_device_playlist", { playlistId });
+  },
+  async stageOrphanRecovery(obfuscatedPath: string): Promise<SyncBatch> {
+    if (window.__TAURI_INTERNALS__) {
+      return window.__TAURI_INTERNALS__.invoke<SyncBatch>(
+        "stage_orphan_recovery",
+        { obfuscatedPath },
+      );
+    }
+    return postJson<SyncBatch>("/api/stage_orphan_recovery", { obfuscatedPath });
+  },
+  async stageOrphanDeletion(obfuscatedPath: string): Promise<SyncBatch> {
+    if (window.__TAURI_INTERNALS__) {
+      return window.__TAURI_INTERNALS__.invoke<SyncBatch>(
+        "stage_orphan_deletion",
+        { obfuscatedPath },
+      );
+    }
+    return postJson<SyncBatch>("/api/stage_orphan_deletion", { obfuscatedPath });
+  },
+  async exportDeviceTracks(
+    trackIds: number[],
+    destinationDir: string,
+  ): Promise<ExportResult> {
+    if (window.__TAURI_INTERNALS__) {
+      return window.__TAURI_INTERNALS__.invoke<ExportResult>(
+        "export_device_tracks",
+        { trackIds, destinationDir },
+      );
+    }
+    return postJson<ExportResult>("/api/export_device_tracks", {
+      trackIds,
+      destinationDir,
+    });
+  },
+  async exportDevicePlaylist(
+    playlistId: number,
+    destinationDir: string,
+  ): Promise<ExportResult> {
+    if (window.__TAURI_INTERNALS__) {
+      return window.__TAURI_INTERNALS__.invoke<ExportResult>(
+        "export_device_playlist",
+        { playlistId, destinationDir },
+      );
+    }
+    return postJson<ExportResult>("/api/export_device_playlist", {
+      playlistId,
+      destinationDir,
+    });
+  },
+  async ejectDevice(force?: boolean): Promise<void> {
+    if (window.__TAURI_INTERNALS__) {
+      return window.__TAURI_INTERNALS__.invoke<void>("eject_device", { force });
+    }
+    return postJson<void>("/api/eject_device", { force: Boolean(force) });
+  },
+  async playHostFile(hostFile: HostFile): Promise<PlaybackStatus> {
+    if (window.__TAURI_INTERNALS__) {
+      return window.__TAURI_INTERNALS__.invoke<PlaybackStatus>(
+        "play_host_file",
+        { hostFile },
+      );
+    }
+    return postJson<PlaybackStatus>("/api/play_host_file", { hostFile });
+  },
+  async playDeviceTrack(trackId: number): Promise<PlaybackStatus> {
+    if (window.__TAURI_INTERNALS__) {
+      return window.__TAURI_INTERNALS__.invoke<PlaybackStatus>(
+        "play_device_track",
+        { trackId },
+      );
+    }
+    return postJson<PlaybackStatus>("/api/play_device_track", { trackId });
+  },
+  async pausePlayback(): Promise<PlaybackStatus> {
+    if (window.__TAURI_INTERNALS__) {
+      return window.__TAURI_INTERNALS__.invoke<PlaybackStatus>("pause_playback");
+    }
+    return postJson<PlaybackStatus>("/api/pause_playback", {});
+  },
+  async resumePlayback(): Promise<PlaybackStatus> {
+    if (window.__TAURI_INTERNALS__) {
+      return window.__TAURI_INTERNALS__.invoke<PlaybackStatus>("resume_playback");
+    }
+    return postJson<PlaybackStatus>("/api/resume_playback", {});
+  },
+  async stopPlayback(): Promise<PlaybackStatus> {
+    if (window.__TAURI_INTERNALS__) {
+      return window.__TAURI_INTERNALS__.invoke<PlaybackStatus>("stop_playback");
+    }
+    return postJson<PlaybackStatus>("/api/stop_playback", {});
+  },
+  async seekPlayback(positionMs: number): Promise<PlaybackStatus> {
+    if (window.__TAURI_INTERNALS__) {
+      return window.__TAURI_INTERNALS__.invoke<PlaybackStatus>(
+        "seek_playback",
+        { positionMs },
+      );
+    }
+    return postJson<PlaybackStatus>("/api/seek_playback", { positionMs });
+  },
+  async setPlaybackVolume(volume: number): Promise<PlaybackStatus> {
+    if (window.__TAURI_INTERNALS__) {
+      return window.__TAURI_INTERNALS__.invoke<PlaybackStatus>(
+        "set_playback_volume",
+        { volume },
+      );
+    }
+    return postJson<PlaybackStatus>("/api/set_playback_volume", { volume });
+  },
+  async getPlaybackStatus(): Promise<PlaybackStatus> {
+    if (window.__TAURI_INTERNALS__) {
+      return window.__TAURI_INTERNALS__.invoke<PlaybackStatus>(
+        "get_playback_status",
+      );
+    }
+    try {
+      const res = await fetch("/api/get_playback_status");
+      if (res.ok) {
+        return (await res.json()) as PlaybackStatus;
+      }
+    } catch {
+      // Fallback
+    }
+    return {
+      state: "stopped",
+      track: null,
+      elapsedMs: 0,
+      durationMs: 0,
+      volume: 1.0,
+    };
   },
 };
 

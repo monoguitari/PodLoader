@@ -2803,6 +2803,348 @@ fn manages_device_playlists_create_rename_delete_add_remove_and_reorder() {
     assert_eq!(post_delete_session.library.tracks.len(), 3);
 }
 
+#[test]
+fn scans_detects_and_recovers_or_deletes_orphan_files() {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let mount_path = temp_dir.path().to_path_buf();
+
+    let adapter = FakeHardwareAdapter {
+        volumes: vec![MountedVolume {
+            mount_path: mount_path.clone(),
+            volume_name: "IPOD_ORPHAN".to_string(),
+            total_bytes: 30_000_000_000,
+            free_bytes: 29_000_000_000,
+            usb_firewire_guid: Some("000A270011223344".to_string()),
+        }],
+    };
+
+    let mut engine = PodLoaderEngine::new(adapter);
+    let init_state = engine
+        .initialize_device(&mount_path, "Classic iPod")
+        .expect("initialize device");
+
+    let session = match init_state {
+        DeviceConnectionState::Connected(s) => s,
+        other => panic!("expected Connected, got {:?}", other),
+    };
+    assert!(session.orphan_files.is_empty());
+
+    // Plant 2 orphan audio files under iPod_Control/Music/Fxx
+    let f07_dir = mount_path.join("iPod_Control").join("Music").join("F07");
+    fs::create_dir_all(&f07_dir).expect("create F07");
+    let orphan1_bytes = build_id3v23_mp3_fixture(
+        "Recoverable Track",
+        "Lost Artist",
+        "Hidden Gems",
+        1,
+        "Ambient",
+        2004,
+        180,
+    );
+    let orphan1_path = f07_dir.join("ORPH.mp3");
+    fs::write(&orphan1_path, &orphan1_bytes).expect("write orphan1");
+
+    let f12_dir = mount_path.join("iPod_Control").join("Music").join("F12");
+    fs::create_dir_all(&f12_dir).expect("create F12");
+    let orphan2_bytes = build_id3v23_mp3_fixture(
+        "Corrupt File",
+        "Junk",
+        "Junk Album",
+        2,
+        "Noise",
+        2001,
+        60,
+    );
+    let orphan2_path = f12_dir.join("DELM.mp3");
+    fs::write(&orphan2_path, &orphan2_bytes).expect("write orphan2");
+
+    // Scan device and verify orphan detection
+    let scan_state = engine.scan_device().expect("scan device");
+    let scanned_session = match scan_state {
+        DeviceConnectionState::Connected(s) => s,
+        other => panic!("expected Connected, got {:?}", other),
+    };
+
+    assert_eq!(scanned_session.orphan_files.len(), 2);
+    let orph1 = scanned_session
+        .orphan_files
+        .iter()
+        .find(|o| o.obfuscated_path == ":iPod_Control:Music:F07:ORPH.mp3")
+        .expect("find orphan 1");
+    assert_eq!(orph1.title, "Recoverable Track");
+    assert_eq!(orph1.artist, "Lost Artist");
+    assert_eq!(orph1.album, "Hidden Gems");
+
+    let orph2 = scanned_session
+        .orphan_files
+        .iter()
+        .find(|o| o.obfuscated_path == ":iPod_Control:Music:F12:DELM.mp3")
+        .expect("find orphan 2");
+    assert_eq!(orph2.title, "Corrupt File");
+
+    // Stage orphan 1 for recovery into Device Library
+    let batch_after_rec = engine
+        .stage_orphan_recovery(":iPod_Control:Music:F07:ORPH.mp3")
+        .expect("stage recovery");
+    assert_eq!(batch_after_rec.orphan_recoveries.len(), 1);
+    assert_eq!(
+        batch_after_rec.orphan_recoveries[0].orphan_file.obfuscated_path,
+        ":iPod_Control:Music:F07:ORPH.mp3"
+    );
+
+    // Stage orphan 2 for deletion to reclaim space
+    let batch_after_del = engine
+        .stage_orphan_deletion(":iPod_Control:Music:F12:DELM.mp3")
+        .expect("stage deletion");
+    assert_eq!(batch_after_del.orphan_deletions.len(), 1);
+    assert_eq!(
+        batch_after_del.orphan_deletions[0].orphan_file.obfuscated_path,
+        ":iPod_Control:Music:F12:DELM.mp3"
+    );
+
+    // Commit the sync batch
+    let outcome = engine.commit_sync_batch().expect("commit sync batch");
+    let committed_session = match outcome {
+        CommitOutcome::Completed(s) => s,
+        other => panic!("expected Completed, got {:?}", other),
+    };
+
+    // Verify orphan 1 is now in Master Playlist and Device Library
+    assert_eq!(committed_session.library.tracks.len(), 1);
+    let recovered_track = &committed_session.library.tracks[0];
+    assert_eq!(recovered_track.title, "Recoverable Track");
+    assert_eq!(recovered_track.artist, "Lost Artist");
+    assert_eq!(recovered_track.album, "Hidden Gems");
+    assert_eq!(
+        recovered_track.obfuscated_path,
+        ":iPod_Control:Music:F07:ORPH.mp3"
+    );
+    assert!(orphan1_path.is_file(), "recovered file must remain on disk");
+
+    // Verify orphan 2 was deleted from disk
+    assert!(!orphan2_path.exists(), "deleted orphan must be removed from disk");
+
+    // Verify no orphans remain after recovery and deletion
+    assert!(committed_session.orphan_files.is_empty());
+}
+
+#[test]
+fn exports_device_tracks_and_playlists_with_sanitized_hierarchy_and_handles_safe_eject() {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let mount_path = temp_dir.path().to_path_buf();
+
+    let export_temp = TempDir::new().expect("create export temp dir");
+    let export_dest = export_temp.path().to_path_buf();
+
+    let adapter = FakeHardwareAdapter {
+        volumes: vec![MountedVolume {
+            mount_path: mount_path.clone(),
+            volume_name: "IPOD_EXPORT".to_string(),
+            total_bytes: 30_000_000_000,
+            free_bytes: 29_000_000_000,
+            usb_firewire_guid: Some("000A270055667788".to_string()),
+        }],
+    };
+
+    let mut engine = PodLoaderEngine::new(adapter);
+    engine
+        .initialize_device(&mount_path, "Export iPod")
+        .expect("initialize device");
+
+    // Create an audio file on disk and recover it so we have a registered device track
+    let f02_dir = mount_path.join("iPod_Control").join("Music").join("F02");
+    fs::create_dir_all(&f02_dir).expect("create F02");
+    let mp3_bytes = build_id3v23_mp3_fixture(
+        "For Those About to Rock (We Salute You): Part 1",
+        "AC/DC",
+        "Who Made Who?",
+        1,
+        "Hard Rock",
+        1986,
+        240,
+    );
+    let track_file = f02_dir.join("ACDC.mp3");
+    fs::write(&track_file, &mp3_bytes).expect("write track file");
+
+    let _ = engine
+        .stage_orphan_recovery(":iPod_Control:Music:F02:ACDC.mp3")
+        .expect("stage recovery");
+    let outcome = engine.commit_sync_batch().expect("commit");
+    let session = match outcome {
+        CommitOutcome::Completed(s) => s,
+        other => panic!("expected Completed, got {:?}", other),
+    };
+    let track_id = session.library.tracks[0].id;
+
+    // Create a user playlist and add this track
+    let playlist = engine
+        .create_device_playlist("Rock Classics")
+        .expect("create playlist");
+    let playlist_id = playlist.id;
+    engine
+        .add_tracks_to_playlist(playlist_id, &[track_id])
+        .expect("add track to playlist");
+
+    // 1. Export single device track
+    let export_result = engine
+        .export_device_tracks(&[track_id], &export_dest)
+        .expect("export device tracks");
+    assert_eq!(export_result.exported_count, 1);
+
+    // Verify sanitized folder hierarchy: Artist/Album/TrackNumber - Title.ext
+    // Notice AC/DC -> AC_DC, Who Made Who? -> Who Made Who_, ":" in title -> "_"
+    let expected_track_path = export_dest
+        .join("AC_DC")
+        .join("Who Made Who_")
+        .join("01 - For Those About to Rock (We Salute You)_ Part 1.mp3");
+    assert!(
+        expected_track_path.is_file(),
+        "expected file at {:?}",
+        expected_track_path
+    );
+    assert_eq!(
+        fs::read(&expected_track_path).expect("read exported file"),
+        mp3_bytes
+    );
+
+    // 2. Export playlist to a separate subfolder
+    let playlist_dest = export_dest.join("Playlist_Export");
+    fs::create_dir_all(&playlist_dest).expect("create playlist dest");
+    let pl_export_result = engine
+        .export_device_playlist(playlist_id, &playlist_dest)
+        .expect("export playlist");
+    assert_eq!(pl_export_result.exported_count, 1);
+    let expected_pl_track = playlist_dest
+        .join("AC_DC")
+        .join("Who Made Who_")
+        .join("01 - For Those About to Rock (We Salute You)_ Part 1.mp3");
+    assert!(expected_pl_track.is_file());
+
+    // 3. Safe Eject pre-checks
+    // Stage an uncommitted change in the Sync Batch
+    let _ = engine
+        .stage_track_metadata_edits(&[track_id], podloader_core::TrackMetadataEdits {
+            rating: Some(5),
+            ..Default::default()
+        })
+        .expect("stage edit");
+
+    // Attempting eject without force must fail with UncommittedChangesPending
+    let eject_err = engine.eject_device(false).expect_err("eject should fail when dirty");
+    match eject_err {
+        PodLoaderError::UncommittedChangesPending => {}
+        other => panic!("expected UncommittedChangesPending, got {:?}", other),
+    }
+
+    // Now commit the batch so it's clean
+    let _ = engine.commit_sync_batch().expect("commit");
+
+    // Ejecting now succeeds and disconnects the device
+    engine.eject_device(false).expect("safe eject succeeds when clean");
+    let state_after_eject = engine.scan_device().expect("scan after eject");
+    assert_eq!(state_after_eject, DeviceConnectionState::Disconnected);
+}
+
+#[test]
+fn plays_host_files_and_device_tracks_with_state_transitions_seeking_volume_and_eject_termination() {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let mount_path = temp_dir.path().to_path_buf();
+
+    let host_temp = TempDir::new().expect("create host temp dir");
+    let host_path = host_temp.path().join("02 - Paranoid Android.wav");
+    let wav_bytes = build_wav_fixture(44_100, 4); // 4 second fixture
+    fs::write(&host_path, &wav_bytes).expect("write wav fixture");
+
+    let adapter = FakeHardwareAdapter {
+        volumes: vec![MountedVolume {
+            mount_path: mount_path.clone(),
+            volume_name: "IPOD_AUDIO".to_string(),
+            total_bytes: 30_000_000_000,
+            free_bytes: 29_000_000_000,
+            usb_firewire_guid: Some("000A270099887766".to_string()),
+        }],
+    };
+
+    let mut engine = PodLoaderEngine::new(adapter);
+    engine
+        .initialize_device(&mount_path, "Audio iPod")
+        .expect("initialize device");
+
+    // Plant a device track
+    let f01_dir = mount_path.join("iPod_Control").join("Music").join("F01");
+    fs::create_dir_all(&f01_dir).expect("create F01");
+    let mp3_bytes = build_id3v23_mp3_fixture(
+        "Airbag",
+        "Radiohead",
+        "OK Computer",
+        1,
+        "Alternative",
+        1997,
+        284,
+    );
+    let dev_track_path = f01_dir.join("AIRB.mp3");
+    fs::write(&dev_track_path, &mp3_bytes).expect("write mp3");
+
+    let _ = engine
+        .stage_orphan_recovery(":iPod_Control:Music:F01:AIRB.mp3")
+        .expect("stage recovery");
+    let outcome = engine.commit_sync_batch().expect("commit");
+    let session = match outcome {
+        CommitOutcome::Completed(s) => s,
+        other => panic!("expected Completed, got {:?}", other),
+    };
+    let dev_track_id = session.library.tracks[0].id;
+
+    // 1. Initial status is Stopped
+    let initial_status = engine.get_playback_status();
+    assert_eq!(initial_status.state, podloader_core::PlaybackState::Stopped);
+    assert!(initial_status.track.is_none());
+
+    // 2. Play Host File
+    let host_listing = engine.browse_host_directory(host_temp.path()).expect("browse host");
+    let host_file = &host_listing.files[0];
+    engine.play_host_file(host_file).expect("play host file");
+
+    let host_playing_status = engine.get_playback_status();
+    assert_eq!(host_playing_status.state, podloader_core::PlaybackState::Playing);
+    let active_host = host_playing_status.track.as_ref().expect("active track");
+    assert_eq!(active_host.source_kind, podloader_core::AudioSourceKind::Host);
+    assert_eq!(active_host.title, "Paranoid Android");
+    assert!(active_host.track_id.is_none());
+
+    // 3. Pause, Resume, Seek, Volume
+    engine.pause_playback().expect("pause");
+    assert_eq!(engine.get_playback_status().state, podloader_core::PlaybackState::Paused);
+
+    engine.resume_playback().expect("resume");
+    assert_eq!(engine.get_playback_status().state, podloader_core::PlaybackState::Playing);
+
+    engine.seek_playback(2_500).expect("seek");
+    assert_eq!(engine.get_playback_status().elapsed_ms, 2_500);
+
+    engine.set_playback_volume(0.65).expect("set volume");
+    assert!((engine.get_playback_status().volume - 0.65).abs() < 0.01);
+
+    // 4. Switch to playing Device Track
+    engine.play_device_track(dev_track_id).expect("play device track");
+    let dev_playing_status = engine.get_playback_status();
+    assert_eq!(dev_playing_status.state, podloader_core::PlaybackState::Playing);
+    let active_dev = dev_playing_status.track.as_ref().expect("active track");
+    assert_eq!(active_dev.source_kind, podloader_core::AudioSourceKind::Device);
+    assert_eq!(active_dev.title, "Airbag");
+    assert_eq!(active_dev.artist, "Radiohead");
+    assert_eq!(active_dev.track_id, Some(dev_track_id));
+
+    // 5. Safe Eject stops active device playback
+    engine.eject_device(false).expect("safe eject");
+    let status_after_eject = engine.get_playback_status();
+    assert_eq!(status_after_eject.state, podloader_core::PlaybackState::Stopped);
+    assert!(status_after_eject.track.is_none());
+}
+
+
+
+
 
 
 

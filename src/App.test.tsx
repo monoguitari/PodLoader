@@ -8,9 +8,12 @@ import type {
   DevicePlaylist,
   DeviceSession,
   DuplicateResolution,
+  ExportResult,
   HostDirectoryListing,
   HostFile,
   InterruptedResolution,
+  OrphanFile,
+  PlaybackStatus,
   PodLoaderBridge,
   SyncBatch,
   TrackMetadataEdits,
@@ -23,6 +26,19 @@ class InMemoryPodLoaderBridge implements PodLoaderBridge {
   private hostListing: HostDirectoryListing;
   private nextStagedId = 1;
   public shouldInterruptNextCommit = false;
+  public playbackStatus: PlaybackStatus = {
+    state: "stopped",
+    track: null,
+    elapsedMs: 0,
+    durationMs: 0,
+    volume: 1.0,
+  };
+  public exportedBatches: Array<{
+    trackIds?: number[];
+    playlistId?: number;
+    destinationDir: string;
+  }> = [];
+  public ejectCallCount = 0;
 
   constructor(
     initialState: DeviceConnectionState,
@@ -272,7 +288,52 @@ class InMemoryPodLoaderBridge implements PodLoaderBridge {
       }
     }
 
-    session.syncBatch = { additions: [], edits: [], removals: [], requiredBytes: 0 };
+    if (batch.orphanRecoveries) {
+      for (const rec of batch.orphanRecoveries) {
+        const newId = 800 + rec.stagedId;
+        session.library.tracks.push({
+          id: newId,
+          title: rec.orphanFile.title,
+          artist: rec.orphanFile.artist,
+          album: rec.orphanFile.album,
+          trackNumber: rec.orphanFile.trackNumber,
+          discNumber: rec.orphanFile.discNumber,
+          genre: rec.orphanFile.genre,
+          year: rec.orphanFile.year,
+          durationMs: rec.orphanFile.durationMs,
+          bitrateKbps: rec.orphanFile.bitrateKbps,
+          playCount: 0,
+          rating: 0,
+          bookmarkMs: 0,
+          obfuscatedPath: rec.orphanFile.obfuscatedPath,
+        });
+        session.library.playlists[0].trackIds.push(newId);
+        if (session.orphanFiles) {
+          session.orphanFiles = session.orphanFiles.filter(
+            (o) => o.obfuscatedPath !== rec.orphanFile.obfuscatedPath,
+          );
+        }
+      }
+    }
+
+    if (batch.orphanDeletions) {
+      for (const del of batch.orphanDeletions) {
+        if (session.orphanFiles) {
+          session.orphanFiles = session.orphanFiles.filter(
+            (o) => o.obfuscatedPath !== del.orphanFile.obfuscatedPath,
+          );
+        }
+      }
+    }
+
+    session.syncBatch = {
+      additions: [],
+      edits: [],
+      removals: [],
+      orphanRecoveries: [],
+      orphanDeletions: [],
+      requiredBytes: 0,
+    };
     session.interruptedBatch = null;
     return { outcome: "completed", data: { ...session } };
   }
@@ -520,6 +581,191 @@ class InMemoryPodLoaderBridge implements PodLoaderBridge {
         },
       },
     };
+  }
+
+  async stageOrphanRecovery(obfuscatedPath: string): Promise<SyncBatch> {
+    if (this.state.status !== "connected") throw new Error("No active device");
+    const session = this.state.data;
+    const batch = session.syncBatch ?? { additions: [], requiredBytes: 0 };
+    batch.orphanRecoveries = batch.orphanRecoveries ?? [];
+    batch.orphanDeletions = (batch.orphanDeletions ?? []).filter(
+      (d) => d.orphanFile.obfuscatedPath !== obfuscatedPath,
+    );
+    const orphan = session.orphanFiles?.find(
+      (o) => o.obfuscatedPath === obfuscatedPath,
+    );
+    if (
+      orphan &&
+      !batch.orphanRecoveries.some(
+        (r) => r.orphanFile.obfuscatedPath === obfuscatedPath,
+      )
+    ) {
+      batch.orphanRecoveries.push({
+        stagedId: this.nextStagedId++,
+        orphanFile: orphan,
+      });
+    }
+    session.syncBatch = { ...batch };
+    return session.syncBatch;
+  }
+
+  async stageOrphanDeletion(obfuscatedPath: string): Promise<SyncBatch> {
+    if (this.state.status !== "connected") throw new Error("No active device");
+    const session = this.state.data;
+    const batch = session.syncBatch ?? { additions: [], requiredBytes: 0 };
+    batch.orphanDeletions = batch.orphanDeletions ?? [];
+    batch.orphanRecoveries = (batch.orphanRecoveries ?? []).filter(
+      (r) => r.orphanFile.obfuscatedPath !== obfuscatedPath,
+    );
+    const orphan = session.orphanFiles?.find(
+      (o) => o.obfuscatedPath === obfuscatedPath,
+    );
+    if (
+      orphan &&
+      !batch.orphanDeletions.some(
+        (d) => d.orphanFile.obfuscatedPath === obfuscatedPath,
+      )
+    ) {
+      batch.orphanDeletions.push({
+        stagedId: this.nextStagedId++,
+        orphanFile: orphan,
+      });
+    }
+    session.syncBatch = { ...batch };
+    return session.syncBatch;
+  }
+
+  async exportDeviceTracks(
+    trackIds: number[],
+    destinationDir: string,
+  ): Promise<ExportResult> {
+    this.exportedBatches.push({ trackIds, destinationDir });
+    return {
+      exportedCount: trackIds.length,
+      exportedFiles: trackIds.map((id) => `${destinationDir}/${id}.mp3`),
+    };
+  }
+
+  async exportDevicePlaylist(
+    playlistId: number,
+    destinationDir: string,
+  ): Promise<ExportResult> {
+    this.exportedBatches.push({ playlistId, destinationDir });
+    return {
+      exportedCount: 1,
+      exportedFiles: [`${destinationDir}/track.mp3`],
+    };
+  }
+
+  async ejectDevice(force?: boolean): Promise<void> {
+    if (this.state.status !== "connected") throw new Error("No active device");
+    const session = this.state.data;
+    const hasUncommitted =
+      (session.syncBatch?.additions?.length ?? 0) > 0 ||
+      (session.syncBatch?.edits?.length ?? 0) > 0 ||
+      (session.syncBatch?.removals?.length ?? 0) > 0 ||
+      (session.syncBatch?.orphanRecoveries?.length ?? 0) > 0 ||
+      (session.syncBatch?.orphanDeletions?.length ?? 0) > 0;
+    if (!force && hasUncommitted) {
+      throw new Error("UncommittedChangesPending");
+    }
+    if (this.playbackStatus.track?.sourceKind === "device") {
+      this.playbackStatus = {
+        state: "stopped",
+        track: null,
+        elapsedMs: 0,
+        durationMs: 0,
+        volume: this.playbackStatus.volume,
+      };
+    }
+    this.ejectCallCount++;
+    this.state = { status: "disconnected" };
+  }
+
+  async playHostFile(hostFile: HostFile): Promise<PlaybackStatus> {
+    this.playbackStatus = {
+      state: "playing",
+      track: {
+        sourceKind: "host",
+        sourcePath: hostFile.path,
+        title: hostFile.title,
+        artist: hostFile.artist,
+        album: hostFile.album,
+        durationMs: hostFile.durationMs,
+        trackId: null,
+      },
+      elapsedMs: 0,
+      durationMs: hostFile.durationMs,
+      volume: this.playbackStatus.volume,
+    };
+    return this.playbackStatus;
+  }
+
+  async playDeviceTrack(trackId: number): Promise<PlaybackStatus> {
+    if (this.state.status !== "connected") throw new Error("No active device");
+    const tr = this.state.data.library.tracks.find((t) => t.id === trackId);
+    if (!tr) throw new Error("Track not found");
+    this.playbackStatus = {
+      state: "playing",
+      track: {
+        sourceKind: "device",
+        sourcePath: tr.obfuscatedPath,
+        title: tr.title,
+        artist: tr.artist,
+        album: tr.album,
+        durationMs: tr.durationMs,
+        trackId: tr.id,
+      },
+      elapsedMs: 0,
+      durationMs: tr.durationMs,
+      volume: this.playbackStatus.volume,
+    };
+    return this.playbackStatus;
+  }
+
+  async pausePlayback(): Promise<PlaybackStatus> {
+    if (this.playbackStatus.state === "playing") {
+      this.playbackStatus = { ...this.playbackStatus, state: "paused" };
+    }
+    return this.playbackStatus;
+  }
+
+  async resumePlayback(): Promise<PlaybackStatus> {
+    if (this.playbackStatus.state === "paused") {
+      this.playbackStatus = { ...this.playbackStatus, state: "playing" };
+    }
+    return this.playbackStatus;
+  }
+
+  async stopPlayback(): Promise<PlaybackStatus> {
+    this.playbackStatus = {
+      state: "stopped",
+      track: null,
+      elapsedMs: 0,
+      durationMs: 0,
+      volume: this.playbackStatus.volume,
+    };
+    return this.playbackStatus;
+  }
+
+  async seekPlayback(positionMs: number): Promise<PlaybackStatus> {
+    this.playbackStatus = {
+      ...this.playbackStatus,
+      elapsedMs: Math.min(positionMs, this.playbackStatus.durationMs),
+    };
+    return this.playbackStatus;
+  }
+
+  async setPlaybackVolume(volume: number): Promise<PlaybackStatus> {
+    this.playbackStatus = {
+      ...this.playbackStatus,
+      volume: Math.max(0, Math.min(1, volume)),
+    };
+    return this.playbackStatus;
+  }
+
+  async getPlaybackStatus(): Promise<PlaybackStatus> {
+    return this.playbackStatus;
   }
 }
 
@@ -1226,5 +1472,258 @@ describe("PodLoaderBridge React UI Seam", () => {
     await user.click(deleteBtn);
 
     expect(within(playlistsSection).queryByText(/Summer Road Trip/i)).not.toBeInTheDocument();
+  });
+
+  test("surfaces orphan files, stages them for recovery or deletion, exports device tracks and playlists, and safely ejects device with uncommitted changes warning", async () => {
+    const user = userEvent.setup();
+    const orphan1: OrphanFile = {
+      path: "/Volumes/IPOD/iPod_Control/Music/F05/GHOST.mp3",
+      obfuscatedPath: ":iPod_Control:Music:F05:GHOST.mp3",
+      fileName: "GHOST.mp3",
+      fileSize: 4_500_000,
+      format: "MP3",
+      title: "Ghost Track",
+      artist: "Unknown Ghost",
+      album: "Lost Songs",
+      trackNumber: 1,
+      discNumber: 1,
+      genre: "Ambient",
+      year: 2005,
+      durationMs: 180_000,
+      bitrateKbps: 320,
+    };
+    const orphan2: OrphanFile = {
+      path: "/Volumes/IPOD/iPod_Control/Music/F12/CORRUPT.mp3",
+      obfuscatedPath: ":iPod_Control:Music:F12:CORRUPT.mp3",
+      fileName: "CORRUPT.mp3",
+      fileSize: 2_000_000,
+      format: "MP3",
+      title: "Junk File",
+      artist: "Junk",
+      album: "Junk",
+      trackNumber: 2,
+      discNumber: 1,
+      genre: "Noise",
+      year: 2002,
+      durationMs: 60_000,
+      bitrateKbps: 128,
+    };
+
+    const bridge = new InMemoryPodLoaderBridge({
+      status: "connected",
+      data: {
+        device: {
+          mountPath: "/Volumes/IPOD",
+          name: "My iPod Classic",
+          modelNumber: "MA147",
+          firewireGuid: "000A270011223344",
+          totalBytes: 30_000_000_000,
+          freeBytes: 25_000_000_000,
+          usedBytes: 5_000_000_000,
+        },
+        library: {
+          tracks: [
+            {
+              id: 101,
+              title: "Airbag",
+              artist: "Radiohead",
+              album: "OK Computer",
+              trackNumber: 1,
+              discNumber: 1,
+              genre: "Alternative",
+              year: 1997,
+              durationMs: 284_000,
+              bitrateKbps: 320,
+              playCount: 10,
+              rating: 5,
+              bookmarkMs: 0,
+              obfuscatedPath: ":iPod_Control:Music:F01:AIRB.mp3",
+            },
+          ],
+          playlists: [
+            { id: 1, name: "My iPod Classic", kind: "master", trackIds: [101] },
+            { id: 2, name: "Favorites", kind: "user", trackIds: [101] },
+          ],
+        },
+        hasPendingPlayCounts: false,
+        syncBatch: { additions: [], requiredBytes: 0 },
+        orphanFiles: [orphan1, orphan2],
+      },
+    });
+
+    render(<App bridge={bridge} />);
+
+    // 1. Verify Orphan Files section is surfaced in UI
+    const orphanSection = await screen.findByRole("region", { name: /Orphan Files/i });
+    expect(within(orphanSection).getByText("Ghost Track")).toBeInTheDocument();
+    expect(within(orphanSection).getByText("Junk File")).toBeInTheDocument();
+
+    // Stage Orphan 1 for Recovery
+    const recoverBtn = within(orphanSection).getByRole("button", { name: /Recover Ghost Track/i });
+    await user.click(recoverBtn);
+
+    // Stage Orphan 2 for Deletion
+    const deleteOrphanBtn = within(orphanSection).getByRole("button", { name: /Delete Junk File/i });
+    await user.click(deleteOrphanBtn);
+
+    // Verify both staged in Sync Batch
+    const syncBatchRegion = screen.getByRole("region", { name: /Sync Batch/i });
+    expect(within(syncBatchRegion).getByText(/Recover: Ghost Track/i)).toBeInTheDocument();
+    expect(within(syncBatchRegion).getByText(/Delete Orphan: Junk File/i)).toBeInTheDocument();
+
+    // 2. Device Export: select track and export
+    const selectAirbag = screen.getByRole("checkbox", { name: /Select Airbag/i });
+    await user.click(selectAirbag);
+    const exportTracksBtn = screen.getByRole("button", { name: /Export Selected Tracks/i });
+    await user.click(exportTracksBtn);
+    expect(bridge.exportedBatches.length).toBe(1);
+    expect(bridge.exportedBatches[0].trackIds).toEqual([101]);
+
+    // Export Playlist
+    const exportPlaylistBtn = screen.getByRole("button", { name: /Export Playlist/i });
+    await user.click(exportPlaylistBtn);
+    expect(bridge.exportedBatches.length).toBe(2);
+
+    // 3. Safe Eject with uncommitted changes warning
+    const ejectBtn = screen.getByRole("button", { name: /Eject Device/i });
+    await user.click(ejectBtn);
+
+    // Warning dialog should appear because sync batch has staged changes
+    const warningDialog = await screen.findByRole("dialog", { name: /Uncommitted Changes/i });
+    expect(warningDialog).toBeInTheDocument();
+    expect(within(warningDialog).getByText(/Sync Batch has uncommitted changes/i)).toBeInTheDocument();
+
+    // Dismiss or cancel warning
+    const cancelEjectBtn = within(warningDialog).getByRole("button", { name: /Cancel/i });
+    await user.click(cancelEjectBtn);
+    expect(bridge.ejectCallCount).toBe(0);
+
+    // Commit Sync Batch
+    const commitBtn = within(syncBatchRegion).getByRole("button", { name: /Commit Sync Batch/i });
+    await user.click(commitBtn);
+
+    // Now batch is clean, click Eject Device again
+    await user.click(ejectBtn);
+    expect(bridge.ejectCallCount).toBe(1);
+    expect(await screen.findByText(/No iPod Device Connected/i)).toBeInTheDocument();
+  });
+
+  test("mini audio player bar previews host files and device tracks with play, pause, seek, volume, and stops on eject", async () => {
+    const user = userEvent.setup();
+    const hostFile: HostFile = {
+      path: "/music/OK Computer/02 - Paranoid Android.flac",
+      fileName: "02 - Paranoid Android.flac",
+      format: "FLAC",
+      fileSize: 35_000_000,
+      title: "Paranoid Android",
+      artist: "Radiohead",
+      album: "OK Computer",
+      trackNumber: 2,
+      discNumber: 1,
+      genre: "Alternative",
+      year: 1997,
+      durationMs: 383_000,
+      bitrateKbps: 900,
+    };
+
+    const bridge = new InMemoryPodLoaderBridge(
+      {
+        status: "connected",
+        data: {
+          device: {
+            mountPath: "/Volumes/IPOD",
+            name: "Classic",
+            totalBytes: 30_000_000_000,
+            freeBytes: 25_000_000_000,
+            usedBytes: 5_000_000_000,
+          },
+          library: {
+            tracks: [
+              {
+                id: 101,
+                title: "Airbag",
+                artist: "Radiohead",
+                album: "OK Computer",
+                trackNumber: 1,
+                discNumber: 1,
+                genre: "Alternative",
+                year: 1997,
+                durationMs: 284_000,
+                bitrateKbps: 320,
+                playCount: 1,
+                rating: 4,
+                bookmarkMs: 0,
+                obfuscatedPath: ":iPod_Control:Music:F01:AIRB.mp3",
+              },
+            ],
+            playlists: [
+              { id: 1, name: "Classic", kind: "master", trackIds: [101] },
+            ],
+          },
+          hasPendingPlayCounts: false,
+          syncBatch: { additions: [], requiredBytes: 0 },
+        },
+      },
+      {
+        currentPath: "/music/OK Computer",
+        parentPath: "/music",
+        subdirectories: [],
+        files: [hostFile],
+      },
+    );
+
+    render(<App bridge={bridge} />);
+
+    // Wait for device to connect and UI to settle
+    await screen.findByRole("heading", { name: "Classic" });
+
+    // 1. Mini Audio Player bar should be visible at bottom
+    const playerBar = await screen.findByRole("region", { name: /Audio Player/i });
+    expect(playerBar).toBeInTheDocument();
+    expect(within(playerBar).getByText(/No track playing/i)).toBeInTheDocument();
+
+    // 2. Play Host File
+    const playHostBtn = await screen.findByRole("button", { name: /Play Paranoid Android/i });
+    await user.click(playHostBtn);
+
+    // Verify track metadata and Host badge in player bar
+    expect(within(playerBar).getByText("Paranoid Android")).toBeInTheDocument();
+    expect(within(playerBar).getByText(/Radiohead — OK Computer/i)).toBeInTheDocument();
+    expect(within(playerBar).getByText("Host")).toBeInTheDocument();
+
+    // 3. Pause and Resume
+    const playPauseBtn = within(playerBar).getByRole("button", { name: /Pause/i });
+    await user.click(playPauseBtn);
+    expect(within(playerBar).getByRole("button", { name: /Play/i })).toBeInTheDocument();
+
+    await user.click(within(playerBar).getByRole("button", { name: /Play/i }));
+    expect(within(playerBar).getByRole("button", { name: /Pause/i })).toBeInTheDocument();
+
+    // 4. Seek and Volume
+    const seekSlider = within(playerBar).getByRole("slider", { name: /Seek track/i });
+    fireEvent.change(seekSlider, { target: { value: 65_000 } });
+    expect(bridge.playbackStatus.elapsedMs).toBe(65_000);
+
+    const volumeSlider = within(playerBar).getByRole("slider", { name: /Volume/i });
+    fireEvent.change(volumeSlider, { target: { value: 0.8 } });
+    expect(bridge.playbackStatus.volume).toBeCloseTo(0.8);
+
+    // 5. Play Device Track
+    const playDeviceBtn = screen.getByRole("button", { name: /Play Airbag/i });
+    await user.click(playDeviceBtn);
+
+    expect(within(playerBar).getByText("Airbag")).toBeInTheDocument();
+    expect(within(playerBar).getByText("Device")).toBeInTheDocument();
+
+    // 6. Safe Eject stops Device audio playback
+    const ejectBtn = screen.getByRole("button", { name: /Eject Device/i });
+    await user.click(ejectBtn);
+
+    const playerBarAfterEject = await screen.findByRole("region", {
+      name: /Audio Player/i,
+    });
+    expect(
+      within(playerBarAfterEject).getByText(/No track playing/i),
+    ).toBeInTheDocument();
   });
 });

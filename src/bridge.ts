@@ -128,10 +128,39 @@ export interface StagedTrackRemoval {
   trackArtist: string;
 }
 
+export interface OrphanFile {
+  path: string;
+  obfuscatedPath: string;
+  fileName: string;
+  fileSize: number;
+  format: string;
+  title: string;
+  artist: string;
+  album: string;
+  trackNumber: number;
+  discNumber: number;
+  genre: string;
+  year: number;
+  durationMs: number;
+  bitrateKbps: number;
+}
+
+export interface StagedOrphanRecovery {
+  stagedId: number;
+  orphanFile: OrphanFile;
+}
+
+export interface StagedOrphanDeletion {
+  stagedId: number;
+  orphanFile: OrphanFile;
+}
+
 export interface SyncBatch {
   additions: StagedTrackAddition[];
   edits?: StagedMetadataEdit[];
   removals?: StagedTrackRemoval[];
+  orphanRecoveries?: StagedOrphanRecovery[];
+  orphanDeletions?: StagedOrphanDeletion[];
   requiredBytes: number;
 }
 
@@ -144,6 +173,32 @@ export interface InterruptedBatchSummary {
 
 export type InterruptedResolution = "commitCompleted" | "rollBack";
 
+export interface ExportResult {
+  exportedCount: number;
+  exportedFiles: string[];
+}
+
+export type AudioSourceKind = "host" | "device";
+export type PlaybackState = "stopped" | "playing" | "paused";
+
+export interface ActivePlaybackTrack {
+  sourceKind: AudioSourceKind;
+  sourcePath: string;
+  title: string;
+  artist: string;
+  album: string;
+  durationMs: number;
+  trackId?: number | null;
+}
+
+export interface PlaybackStatus {
+  state: PlaybackState;
+  track?: ActivePlaybackTrack | null;
+  elapsedMs: number;
+  durationMs: number;
+  volume: number;
+}
+
 export interface DeviceSession {
   device: DeviceMetadata;
   library: DeviceLibrary;
@@ -152,6 +207,7 @@ export interface DeviceSession {
   interruptedBatch?: InterruptedBatchSummary | null;
   transcodePreset?: TranscodePreset;
   ffmpegAvailable?: boolean;
+  orphanFiles?: OrphanFile[];
 }
 
 export type CommitOutcome =
@@ -209,4 +265,23 @@ export interface PodLoaderBridge {
     newName: string,
   ): Promise<DevicePlaylist>;
   deleteDevicePlaylist?(playlistId: number): Promise<void>;
+  stageOrphanRecovery?(obfuscatedPath: string): Promise<SyncBatch>;
+  stageOrphanDeletion?(obfuscatedPath: string): Promise<SyncBatch>;
+  exportDeviceTracks?(
+    trackIds: number[],
+    destinationDir: string,
+  ): Promise<ExportResult>;
+  exportDevicePlaylist?(
+    playlistId: number,
+    destinationDir: string,
+  ): Promise<ExportResult>;
+  ejectDevice?(force?: boolean): Promise<void>;
+  playHostFile?(hostFile: HostFile): Promise<PlaybackStatus>;
+  playDeviceTrack?(trackId: number): Promise<PlaybackStatus>;
+  pausePlayback?(): Promise<PlaybackStatus>;
+  resumePlayback?(): Promise<PlaybackStatus>;
+  stopPlayback?(): Promise<PlaybackStatus>;
+  seekPlayback?(positionMs: number): Promise<PlaybackStatus>;
+  setPlaybackVolume?(volume: number): Promise<PlaybackStatus>;
+  getPlaybackStatus?(): Promise<PlaybackStatus>;
 }

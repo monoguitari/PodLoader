@@ -5,8 +5,10 @@ import type {
   DeviceTrack,
   DuplicateResolution,
   HostDirectoryListing,
+  HostFile,
   InterruptedBatchSummary,
   InterruptedResolution,
+  PlaybackStatus,
   PodLoaderBridge,
   SyncBatch,
   TrackMetadataEdits,
@@ -243,6 +245,42 @@ export function App({ bridge }: AppProps) {
   const [editIsCompilation, setEditIsCompilation] = useState<boolean>(false);
   const [compilationModified, setCompilationModified] = useState<boolean>(false);
   const [targetPlaylistId, setTargetPlaylistId] = useState<number | null>(null);
+  const [playbackStatus, setPlaybackStatus] = useState<PlaybackStatus>({
+    state: "stopped",
+    track: null,
+    elapsedMs: 0,
+    durationMs: 0,
+    volume: 1.0,
+  });
+  const [showEjectWarning, setShowEjectWarning] = useState<boolean>(false);
+  const [exportDestination, setExportDestination] = useState<string>(
+    "/music/PodLoader_Export",
+  );
+  const [exportSuccessMessage, setExportSuccessMessage] = useState<string | null>(
+    null,
+  );
+
+  useEffect(() => {
+    if (playbackStatus.state !== "playing") return;
+    const interval = window.setInterval(() => {
+      setPlaybackStatus((prev) => {
+        if (prev.state !== "playing") return prev;
+        const nextElapsed = prev.elapsedMs + 250;
+        if (prev.durationMs > 0 && nextElapsed >= prev.durationMs) {
+          return {
+            ...prev,
+            state: "stopped",
+            elapsedMs: prev.durationMs,
+          };
+        }
+        return {
+          ...prev,
+          elapsedMs: nextElapsed,
+        };
+      });
+    }, 250);
+    return () => window.clearInterval(interval);
+  }, [playbackStatus.state]);
 
   const applyConnectionState = useCallback((state: DeviceConnectionState) => {
     setConnection(state);
@@ -310,11 +348,231 @@ export function App({ bridge }: AppProps) {
       .filter((t): t is DeviceTrack => t !== undefined);
   }, [activeSession, selectedPlaylist]);
 
+  const handlePlayHostFile = async (hostFile: HostFile) => {
+    if (!bridge.playHostFile) return;
+    try {
+      const status = await bridge.playHostFile(hostFile);
+      setPlaybackStatus(status);
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handlePlayDeviceTrack = async (trackId: number) => {
+    if (!bridge.playDeviceTrack) return;
+    try {
+      const status = await bridge.playDeviceTrack(trackId);
+      setPlaybackStatus(status);
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleTogglePlayPause = async () => {
+    if (playbackStatus.state === "playing" && bridge.pausePlayback) {
+      const status = await bridge.pausePlayback();
+      setPlaybackStatus(status);
+    } else if (playbackStatus.state === "paused" && bridge.resumePlayback) {
+      const status = await bridge.resumePlayback();
+      setPlaybackStatus(status);
+    }
+  };
+
+  const handleStopPlayback = async () => {
+    if (!bridge.stopPlayback) return;
+    const status = await bridge.stopPlayback();
+    setPlaybackStatus(status);
+  };
+
+  const handleSeekPlayback = async (positionMs: number) => {
+    if (!bridge.seekPlayback) return;
+    const status = await bridge.seekPlayback(positionMs);
+    setPlaybackStatus(status);
+  };
+
+  const handleVolumeChange = async (volume: number) => {
+    if (!bridge.setPlaybackVolume) return;
+    const status = await bridge.setPlaybackVolume(volume);
+    setPlaybackStatus(status);
+  };
+
+  const hasUncommittedChanges = useMemo(() => {
+    return (
+      (syncBatch.additions?.length ?? 0) > 0 ||
+      (syncBatch.edits?.length ?? 0) > 0 ||
+      (syncBatch.removals?.length ?? 0) > 0 ||
+      (syncBatch.orphanRecoveries?.length ?? 0) > 0 ||
+      (syncBatch.orphanDeletions?.length ?? 0) > 0
+    );
+  }, [syncBatch]);
+
+  const handleEjectClick = () => {
+    if (hasUncommittedChanges) {
+      setShowEjectWarning(true);
+    } else {
+      executeEject(false);
+    }
+  };
+
+  const executeEject = async (force: boolean) => {
+    if (!bridge.ejectDevice) return;
+    try {
+      await bridge.ejectDevice(force);
+      if (bridge.getPlaybackStatus) {
+        const status = await bridge.getPlaybackStatus();
+        setPlaybackStatus(status);
+      } else {
+        setPlaybackStatus((prev) => {
+          if (prev.track?.sourceKind === "device") {
+            return {
+              state: "stopped",
+              track: null,
+              elapsedMs: 0,
+              durationMs: 0,
+              volume: prev.volume,
+            };
+          }
+          return prev;
+        });
+      }
+      setShowEjectWarning(false);
+      applyConnectionState({ status: "disconnected" });
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleStageOrphanRecovery = async (obfuscatedPath: string) => {
+    if (!bridge.stageOrphanRecovery) return;
+    try {
+      const updated = await bridge.stageOrphanRecovery(obfuscatedPath);
+      setSyncBatch(updated);
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleStageOrphanDeletion = async (obfuscatedPath: string) => {
+    if (!bridge.stageOrphanDeletion) return;
+    try {
+      const updated = await bridge.stageOrphanDeletion(obfuscatedPath);
+      setSyncBatch(updated);
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleExportSelectedTracks = async () => {
+    if (!bridge.exportDeviceTracks || selectedTrackIds.length === 0) return;
+    try {
+      const dest = exportDestination.trim() || "/music/PodLoader_Export";
+      const res = await bridge.exportDeviceTracks(selectedTrackIds, dest);
+      setExportSuccessMessage(`Exported ${res.exportedCount} track(s)`);
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleExportPlaylist = async () => {
+    if (!bridge.exportDevicePlaylist || !selectedPlaylist) return;
+    try {
+      const dest = exportDestination.trim() || "/music/PodLoader_Export";
+      const res = await bridge.exportDevicePlaylist(selectedPlaylist.id, dest);
+      setExportSuccessMessage(
+        `Exported playlist: ${selectedPlaylist.name} (${res.exportedCount} tracks)`,
+      );
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const renderPlayerBar = () => (
+    <footer
+      role="region"
+      aria-label="Audio Player"
+      className="mini-audio-player-bar"
+    >
+      <div className="player-track-info">
+        {playbackStatus.track ? (
+          <>
+            <span className="player-track-title">
+              {playbackStatus.track.title}
+            </span>
+            <span className="player-track-artist-album">
+              {playbackStatus.track.artist} — {playbackStatus.track.album}
+            </span>
+            <span
+              className={`player-source-badge ${playbackStatus.track.sourceKind}`}
+            >
+              {playbackStatus.track.sourceKind === "host" ? "Host" : "Device"}
+            </span>
+          </>
+        ) : (
+          <span className="player-idle">No track playing</span>
+        )}
+      </div>
+      <div className="player-controls">
+        <button
+          type="button"
+          aria-label={playbackStatus.state === "playing" ? "Pause" : "Play"}
+          disabled={!playbackStatus.track}
+          onClick={handleTogglePlayPause}
+        >
+          {playbackStatus.state === "playing" ? "Pause" : "Play"}
+        </button>
+        <button
+          type="button"
+          aria-label="Stop"
+          disabled={playbackStatus.state === "stopped"}
+          onClick={handleStopPlayback}
+        >
+          Stop
+        </button>
+        <span className="player-time">
+          {formatDuration(playbackStatus.elapsedMs)}
+        </span>
+        <input
+          type="range"
+          role="slider"
+          aria-label="Seek track"
+          min={0}
+          max={playbackStatus.durationMs || 100}
+          value={playbackStatus.elapsedMs}
+          disabled={!playbackStatus.track}
+          onChange={(e) => handleSeekPlayback(Number(e.target.value))}
+        />
+        <span className="player-time">
+          {formatDuration(playbackStatus.durationMs)}
+        </span>
+        <label htmlFor="player-volume-slider">Volume</label>
+        <input
+          id="player-volume-slider"
+          type="range"
+          role="slider"
+          aria-label="Volume"
+          min={0}
+          max={1}
+          step={0.01}
+          value={playbackStatus.volume}
+          onChange={(e) => handleVolumeChange(Number(e.target.value))}
+        />
+      </div>
+    </footer>
+  );
+
   if (connection.status === "disconnected") {
     return (
       <main>
         <h1>PodLoader</h1>
-        <p>Connect a USB mass-storage Device to view its Device Library.</p>
+        <p>No iPod Device Connected. Connect a USB mass-storage Device to view its Device Library.</p>
+        {renderPlayerBar()}
       </main>
     );
   }
@@ -348,6 +606,7 @@ export function App({ bridge }: AppProps) {
             Initialize Device
           </button>
         </div>
+        {renderPlayerBar()}
       </main>
     );
   }
@@ -658,7 +917,12 @@ export function App({ bridge }: AppProps) {
     <div className="podloader-shell">
       <header className="device-header">
         <div>
-          <h1>{device.name}</h1>
+          <div className="device-title-row">
+            <h1>{device.name}</h1>
+            <button type="button" onClick={handleEjectClick}>
+              Eject Device
+            </button>
+          </div>
           <p>
             {device.modelNumber && <span>Model: {device.modelNumber} </span>}
             {device.firewireGuid && (
@@ -721,6 +985,12 @@ export function App({ bridge }: AppProps) {
       {errorMessage && (
         <div role="alert" className="error-banner">
           {errorMessage}
+        </div>
+      )}
+
+      {exportSuccessMessage && (
+        <div role="status" className="success-banner">
+          {exportSuccessMessage}
         </div>
       )}
 
@@ -811,6 +1081,7 @@ export function App({ bridge }: AppProps) {
                 <tr
                   key={hf.path}
                   draggable
+                  onDoubleClick={() => handlePlayHostFile(hf)}
                   onDragStart={(e) => {
                     e.dataTransfer.setData("text/podloader-path", hf.path);
                     e.dataTransfer.setData("text/plain", hf.path);
@@ -823,6 +1094,13 @@ export function App({ bridge }: AppProps) {
                   <td>{formatDuration(hf.durationMs)}</td>
                   <td>{hf.format}</td>
                   <td>
+                    <button
+                      type="button"
+                      aria-label={`Play ${hf.title}`}
+                      onClick={() => handlePlayHostFile(hf)}
+                    >
+                      ▶
+                    </button>
                     <button
                       type="button"
                       onClick={() => handleStagePaths([hf.path])}
@@ -871,11 +1149,15 @@ export function App({ bridge }: AppProps) {
           const hasStagedItems =
             syncBatch.additions.length > 0 ||
             (syncBatch.edits && syncBatch.edits.length > 0) ||
-            (syncBatch.removals && syncBatch.removals.length > 0);
+            (syncBatch.removals && syncBatch.removals.length > 0) ||
+            (syncBatch.orphanRecoveries && syncBatch.orphanRecoveries.length > 0) ||
+            (syncBatch.orphanDeletions && syncBatch.orphanDeletions.length > 0);
           const totalStagedCount =
             syncBatch.additions.length +
             (syncBatch.edits?.length ?? 0) +
-            (syncBatch.removals?.length ?? 0);
+            (syncBatch.removals?.length ?? 0) +
+            (syncBatch.orphanRecoveries?.length ?? 0) +
+            (syncBatch.orphanDeletions?.length ?? 0);
 
           return (
             <main
@@ -1002,6 +1284,20 @@ export function App({ bridge }: AppProps) {
                     </span>
                   </li>
                 ))}
+                {syncBatch.orphanRecoveries?.map((rec) => (
+                  <li key={`rec-${rec.stagedId}`}>
+                    <span>
+                      Recover: {rec.orphanFile.title} ({rec.orphanFile.obfuscatedPath})
+                    </span>
+                  </li>
+                ))}
+                {syncBatch.orphanDeletions?.map((del) => (
+                  <li key={`del-${del.stagedId}`}>
+                    <span>
+                      Delete Orphan: {del.orphanFile.title} ({del.orphanFile.obfuscatedPath})
+                    </span>
+                  </li>
+                ))}
               </ul>
 
               <div className="sync-batch-actions">
@@ -1019,6 +1315,55 @@ export function App({ bridge }: AppProps) {
                   </button>
                 )}
               </div>
+            </section>
+          )}
+
+          {activeSession?.orphanFiles && activeSession.orphanFiles.length > 0 && (
+            <section aria-label="Orphan Files" className="orphan-files-section">
+              <h2>Orphan Files ({activeSession.orphanFiles.length})</h2>
+              <table aria-label="Orphan Files List">
+                <thead>
+                  <tr>
+                    <th>Title</th>
+                    <th>Artist</th>
+                    <th>Album</th>
+                    <th>Format</th>
+                    <th>Size</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {activeSession.orphanFiles.map((orphan) => (
+                    <tr key={orphan.obfuscatedPath}>
+                      <td>{orphan.title}</td>
+                      <td>{orphan.artist}</td>
+                      <td>{orphan.album}</td>
+                      <td>{orphan.format}</td>
+                      <td>{formatGigabytes(orphan.fileSize)}</td>
+                      <td>
+                        <button
+                          type="button"
+                          aria-label={`Recover ${orphan.title}`}
+                          onClick={() =>
+                            handleStageOrphanRecovery(orphan.obfuscatedPath)
+                          }
+                        >
+                          Recover into Device Library
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`Delete ${orphan.title}`}
+                          onClick={() =>
+                            handleStageOrphanDeletion(orphan.obfuscatedPath)
+                          }
+                        >
+                          Delete Orphan
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </section>
           )}
 
@@ -1040,6 +1385,26 @@ export function App({ bridge }: AppProps) {
               onClick={handleStageRemovals}
             >
               Remove from iPod
+            </button>
+            <div className="export-destination-group">
+              <label htmlFor="export-destination-input">Export Folder:</label>
+              <input
+                id="export-destination-input"
+                aria-label="Export Destination"
+                type="text"
+                value={exportDestination}
+                onChange={(e) => setExportDestination(e.target.value)}
+              />
+            </div>
+            <button
+              type="button"
+              disabled={selectedTrackIds.length === 0}
+              onClick={handleExportSelectedTracks}
+            >
+              Export Selected Tracks
+            </button>
+            <button type="button" onClick={handleExportPlaylist}>
+              Export Playlist
             </button>
             {selectedPlaylist?.kind === "user" && (
               <button
@@ -1114,7 +1479,10 @@ export function App({ bridge }: AppProps) {
             </thead>
             <tbody>
               {orderedTracks.map((track, idx) => (
-                <tr key={track.id}>
+                <tr
+                  key={track.id}
+                  onDoubleClick={() => handlePlayDeviceTrack(track.id)}
+                >
                   <td>
                     <input
                       type="checkbox"
@@ -1131,7 +1499,16 @@ export function App({ bridge }: AppProps) {
                       }}
                     />
                   </td>
-                  <td>{track.title}</td>
+                  <td>
+                    <button
+                      type="button"
+                      aria-label={`Play ${track.title}`}
+                      onClick={() => handlePlayDeviceTrack(track.id)}
+                    >
+                      ▶
+                    </button>
+                    <span>{track.title}</span>
+                  </td>
                   <td>{track.artist}</td>
                   <td>{track.album}</td>
                   <td>{track.trackNumber}</td>
@@ -1304,6 +1681,32 @@ export function App({ bridge }: AppProps) {
           </div>
         </div>
       )}
+
+      {showEjectWarning && (
+        <div
+          role="dialog"
+          aria-label="Uncommitted Changes"
+          className="modal-overlay"
+        >
+          <div className="modal-content">
+            <h3>Uncommitted Changes</h3>
+            <p>Sync Batch has uncommitted changes. Eject anyway?</p>
+            <div className="modal-actions">
+              <button type="button" onClick={() => executeEject(true)}>
+                Eject Anyway
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowEjectWarning(false)}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {renderPlayerBar()}
     </div>
   );
 }
