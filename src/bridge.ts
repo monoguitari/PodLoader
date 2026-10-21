@@ -32,6 +32,8 @@ export interface DeviceTrack {
   lastPlayedTimestamp?: number | null;
   bookmarkMs: number;
   obfuscatedPath: string;
+  albumArtist?: string | null;
+  isCompilation?: boolean;
 }
 
 export type PlaylistKind = "master" | "user" | "smart";
@@ -100,8 +102,36 @@ export interface TransferProgress {
   overallPercent: number;
 }
 
+export interface TrackMetadataEdits {
+  title?: string | null;
+  artist?: string | null;
+  album?: string | null;
+  albumArtist?: string | null;
+  trackNumber?: number | null;
+  discNumber?: number | null;
+  genre?: string | null;
+  year?: number | null;
+  isCompilation?: boolean | null;
+  rating?: number | null;
+}
+
+export interface StagedMetadataEdit {
+  stagedId: number;
+  trackId: number;
+  edits: TrackMetadataEdits;
+}
+
+export interface StagedTrackRemoval {
+  stagedId: number;
+  trackId: number;
+  trackTitle: string;
+  trackArtist: string;
+}
+
 export interface SyncBatch {
   additions: StagedTrackAddition[];
+  edits?: StagedMetadataEdit[];
+  removals?: StagedTrackRemoval[];
   requiredBytes: number;
 }
 
@@ -157,4 +187,26 @@ export interface PodLoaderBridge {
   ): Promise<DeviceSession>;
   setManualFirewireGuid?(guid: string): Promise<DeviceSession>;
   setTranscodePreset?(preset: TranscodePreset): Promise<DeviceSession>;
+  stageTrackMetadataEdits?(
+    edits: Array<{ trackId: number; edits: TrackMetadataEdits }>,
+  ): Promise<SyncBatch>;
+  stageTrackRemovals?(trackIds: number[]): Promise<SyncBatch>;
+  createDevicePlaylist?(name: string): Promise<DevicePlaylist>;
+  addTracksToPlaylist?(
+    playlistId: number,
+    trackIds: number[],
+  ): Promise<DevicePlaylist>;
+  reorderPlaylistTracks?(
+    playlistId: number,
+    trackIds: number[],
+  ): Promise<DevicePlaylist>;
+  removeTracksFromPlaylist?(
+    playlistId: number,
+    trackIds: number[],
+  ): Promise<DevicePlaylist>;
+  renameDevicePlaylist?(
+    playlistId: number,
+    newName: string,
+  ): Promise<DevicePlaylist>;
+  deleteDevicePlaylist?(playlistId: number): Promise<void>;
 }

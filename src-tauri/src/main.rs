@@ -256,6 +256,85 @@ fn handle_http_client(mut stream: std::net::TcpStream, state: &AppState) -> std:
             Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
             Err(e) => serde_json::json!({ "error": e }).to_string(),
         }
+    } else if first_line.starts_with("POST /api/stage_track_metadata_edits") {
+        let track_ids: Vec<u32> = if let Some(arr) = parsed["trackIds"].as_array() {
+            arr.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect()
+        } else if let Some(arr) = parsed["edits"].as_array() {
+            arr.iter().filter_map(|item| item["trackId"].as_u64().map(|n| n as u32)).collect()
+        } else {
+            Vec::new()
+        };
+        let edits: podloader_core::TrackMetadataEdits = if let Some(arr) = parsed["edits"].as_array() {
+            if let Some(first) = arr.first() {
+                serde_json::from_value(first["edits"].clone()).unwrap_or_default()
+            } else {
+                Default::default()
+            }
+        } else {
+            serde_json::from_value(parsed["edits"].clone()).unwrap_or_default()
+        };
+        match state.stage_track_metadata_edits(&track_ids, edits) {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("POST /api/stage_track_removals") {
+        let track_ids: Vec<u32> = parsed["trackIds"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect())
+            .unwrap_or_default();
+        match state.stage_track_removals(&track_ids) {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("POST /api/create_device_playlist") {
+        let name = parsed["name"].as_str().unwrap_or("New Playlist");
+        match state.create_device_playlist(name) {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("POST /api/add_tracks_to_playlist") {
+        let playlist_id = parsed["playlistId"].as_u64().unwrap_or(0);
+        let track_ids: Vec<u32> = parsed["trackIds"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect())
+            .unwrap_or_default();
+        match state.add_tracks_to_playlist(playlist_id, &track_ids) {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("POST /api/reorder_playlist_tracks") {
+        let playlist_id = parsed["playlistId"].as_u64().unwrap_or(0);
+        let track_ids: Vec<u32> = parsed["trackIds"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect())
+            .unwrap_or_default();
+        match state.reorder_playlist_tracks(playlist_id, &track_ids) {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("POST /api/remove_tracks_from_playlist") {
+        let playlist_id = parsed["playlistId"].as_u64().unwrap_or(0);
+        let track_ids: Vec<u32> = parsed["trackIds"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect())
+            .unwrap_or_default();
+        match state.remove_tracks_from_playlist(playlist_id, &track_ids) {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("POST /api/rename_device_playlist") {
+        let playlist_id = parsed["playlistId"].as_u64().unwrap_or(0);
+        let new_name = parsed["newName"].as_str().unwrap_or("");
+        match state.rename_device_playlist(playlist_id, new_name) {
+            Ok(res) => serde_json::to_string(&res).unwrap_or_default(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
+    } else if first_line.starts_with("POST /api/delete_device_playlist") {
+        let playlist_id = parsed["playlistId"].as_u64().unwrap_or(0);
+        match state.delete_device_playlist(playlist_id) {
+            Ok(()) => serde_json::json!({ "status": "ok" }).to_string(),
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        }
     } else {
         serde_json::json!({ "status": "ok" }).to_string()
     };

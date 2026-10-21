@@ -3,9 +3,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use podloader_core::{
-    CommitOutcome, DeviceConnectionState, DeviceSession, DuplicateResolution,
+    CommitOutcome, DeviceConnectionState, DevicePlaylist, DeviceSession, DuplicateResolution,
     HardwareDeviceAdapter, HostDirectoryListing, InterruptedResolution, PodLoaderEngine,
-    SyncBatch, SystemHardwareDeviceAdapter, TranscodePreset,
+    SyncBatch, SystemHardwareDeviceAdapter, TrackMetadataEdits, TranscodePreset,
 };
 
 pub struct AppState<A: HardwareDeviceAdapter = SystemHardwareDeviceAdapter> {
@@ -113,6 +113,82 @@ impl<A: HardwareDeviceAdapter> AppState<A> {
         let mut guard = self.engine.lock().map_err(|e| e.to_string())?;
         guard
             .set_transcode_preset(preset)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn stage_track_metadata_edits(
+        &self,
+        track_ids: &[u32],
+        edits: TrackMetadataEdits,
+    ) -> Result<SyncBatch, String> {
+        let mut guard = self.engine.lock().map_err(|e| e.to_string())?;
+        guard
+            .stage_track_metadata_edits(track_ids, edits)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn stage_track_removals(&self, track_ids: &[u32]) -> Result<SyncBatch, String> {
+        let mut guard = self.engine.lock().map_err(|e| e.to_string())?;
+        guard
+            .stage_track_removals(track_ids)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn create_device_playlist(&self, name: &str) -> Result<DevicePlaylist, String> {
+        let mut guard = self.engine.lock().map_err(|e| e.to_string())?;
+        guard
+            .create_device_playlist(name)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn add_tracks_to_playlist(
+        &self,
+        playlist_id: u64,
+        track_ids: &[u32],
+    ) -> Result<DevicePlaylist, String> {
+        let mut guard = self.engine.lock().map_err(|e| e.to_string())?;
+        guard
+            .add_tracks_to_playlist(playlist_id, track_ids)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn reorder_playlist_tracks(
+        &self,
+        playlist_id: u64,
+        track_ids: &[u32],
+    ) -> Result<DevicePlaylist, String> {
+        let mut guard = self.engine.lock().map_err(|e| e.to_string())?;
+        guard
+            .reorder_playlist_tracks(playlist_id, track_ids)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn remove_tracks_from_playlist(
+        &self,
+        playlist_id: u64,
+        track_ids: &[u32],
+    ) -> Result<DevicePlaylist, String> {
+        let mut guard = self.engine.lock().map_err(|e| e.to_string())?;
+        guard
+            .remove_tracks_from_playlist(playlist_id, track_ids)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn rename_device_playlist(
+        &self,
+        playlist_id: u64,
+        new_name: &str,
+    ) -> Result<DevicePlaylist, String> {
+        let mut guard = self.engine.lock().map_err(|e| e.to_string())?;
+        guard
+            .rename_device_playlist(playlist_id, new_name)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn delete_device_playlist(&self, playlist_id: u64) -> Result<(), String> {
+        let mut guard = self.engine.lock().map_err(|e| e.to_string())?;
+        guard
+            .delete_device_playlist(playlist_id)
             .map_err(|e| e.to_string())
     }
 }

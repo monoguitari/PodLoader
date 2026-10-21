@@ -5,6 +5,7 @@ import { App } from "./App";
 import type {
   CommitOutcome,
   DeviceConnectionState,
+  DevicePlaylist,
   DeviceSession,
   DuplicateResolution,
   HostDirectoryListing,
@@ -12,6 +13,7 @@ import type {
   InterruptedResolution,
   PodLoaderBridge,
   SyncBatch,
+  TrackMetadataEdits,
   TranscodePreset,
   TransferProgress,
 } from "./bridge";
@@ -242,7 +244,35 @@ class InMemoryPodLoaderBridge implements PodLoaderBridge {
       }
     }
 
-    session.syncBatch = { additions: [], requiredBytes: 0 };
+    if (batch.edits) {
+      for (const edit of batch.edits) {
+        const tr = session.library.tracks.find((t) => t.id === edit.trackId);
+        if (tr) {
+          if (edit.edits.title !== undefined && edit.edits.title !== null) tr.title = edit.edits.title;
+          if (edit.edits.artist !== undefined && edit.edits.artist !== null) tr.artist = edit.edits.artist;
+          if (edit.edits.album !== undefined && edit.edits.album !== null) tr.album = edit.edits.album;
+          if (edit.edits.albumArtist !== undefined) tr.albumArtist = edit.edits.albumArtist;
+          if (edit.edits.trackNumber !== undefined && edit.edits.trackNumber !== null) tr.trackNumber = edit.edits.trackNumber;
+          if (edit.edits.discNumber !== undefined && edit.edits.discNumber !== null) tr.discNumber = edit.edits.discNumber;
+          if (edit.edits.genre !== undefined && edit.edits.genre !== null) tr.genre = edit.edits.genre;
+          if (edit.edits.year !== undefined && edit.edits.year !== null) tr.year = edit.edits.year;
+          if (edit.edits.isCompilation !== undefined && edit.edits.isCompilation !== null) tr.isCompilation = edit.edits.isCompilation;
+          if (edit.edits.rating !== undefined && edit.edits.rating !== null) tr.rating = edit.edits.rating;
+        }
+      }
+    }
+
+    if (batch.removals) {
+      const removalIds = batch.removals.map((r) => r.trackId);
+      session.library.tracks = session.library.tracks.filter(
+        (t) => !removalIds.includes(t.id),
+      );
+      for (const pl of session.library.playlists) {
+        pl.trackIds = pl.trackIds.filter((id) => !removalIds.includes(id));
+      }
+    }
+
+    session.syncBatch = { additions: [], edits: [], removals: [], requiredBytes: 0 };
     session.interruptedBatch = null;
     return { outcome: "completed", data: { ...session } };
   }
@@ -312,6 +342,184 @@ class InMemoryPodLoaderBridge implements PodLoaderBridge {
       };
     }
     return { ...this.state.data };
+  }
+
+  async stageTrackMetadataEdits(
+    edits: Array<{ trackId: number; edits: TrackMetadataEdits }>,
+  ): Promise<SyncBatch> {
+    if (this.state.status !== "connected") throw new Error("No active device");
+    const session = this.state.data;
+    const batch = session.syncBatch ?? { additions: [], requiredBytes: 0 };
+    batch.edits = batch.edits ?? [];
+    for (const item of edits) {
+      const existing = batch.edits.find((e) => e.trackId === item.trackId);
+      if (existing) {
+        existing.edits = { ...existing.edits, ...item.edits };
+      } else {
+        batch.edits.push({
+          stagedId: this.nextStagedId++,
+          trackId: item.trackId,
+          edits: item.edits,
+        });
+      }
+    }
+    session.syncBatch = { ...batch };
+    return session.syncBatch;
+  }
+
+  async stageTrackRemovals(trackIds: number[]): Promise<SyncBatch> {
+    if (this.state.status !== "connected") throw new Error("No active device");
+    const session = this.state.data;
+    const batch = session.syncBatch ?? { additions: [], requiredBytes: 0 };
+    batch.removals = batch.removals ?? [];
+    for (const tid of trackIds) {
+      const tr = session.library.tracks.find((t) => t.id === tid);
+      if (tr && !batch.removals.some((r) => r.trackId === tid)) {
+        batch.removals.push({
+          stagedId: this.nextStagedId++,
+          trackId: tid,
+          trackTitle: tr.title,
+          trackArtist: tr.artist,
+        });
+      }
+    }
+    session.syncBatch = { ...batch };
+    return session.syncBatch;
+  }
+
+  async createDevicePlaylist(name: string): Promise<DevicePlaylist> {
+    if (this.state.status !== "connected") throw new Error("No active device");
+    const session = this.state.data;
+    const newId =
+      (session.library.playlists
+        .map((p) => p.id)
+        .reduce((max, id) => Math.max(max, id), 1000) ?? 1000) + 1;
+    const pl: DevicePlaylist = {
+      id: newId,
+      name,
+      kind: "user",
+      trackIds: [],
+    };
+    session.library.playlists.push(pl);
+    this.state = {
+      ...this.state,
+      data: {
+        ...session,
+        library: {
+          ...session.library,
+          playlists: [...session.library.playlists],
+        },
+      },
+    };
+    return pl;
+  }
+
+  async addTracksToPlaylist(
+    playlistId: number,
+    trackIds: number[],
+  ): Promise<DevicePlaylist> {
+    if (this.state.status !== "connected") throw new Error("No active device");
+    const session = this.state.data;
+    const pl = session.library.playlists.find((p) => p.id === playlistId);
+    if (!pl) throw new Error("Playlist not found");
+    for (const tid of trackIds) {
+      pl.trackIds.push(tid);
+    }
+    this.state = {
+      ...this.state,
+      data: {
+        ...session,
+        library: {
+          ...session.library,
+          playlists: [...session.library.playlists],
+        },
+      },
+    };
+    return pl;
+  }
+
+  async reorderPlaylistTracks(
+    playlistId: number,
+    trackIds: number[],
+  ): Promise<DevicePlaylist> {
+    if (this.state.status !== "connected") throw new Error("No active device");
+    const session = this.state.data;
+    const pl = session.library.playlists.find((p) => p.id === playlistId);
+    if (!pl) throw new Error("Playlist not found");
+    pl.trackIds = [...trackIds];
+    this.state = {
+      ...this.state,
+      data: {
+        ...session,
+        library: {
+          ...session.library,
+          playlists: [...session.library.playlists],
+        },
+      },
+    };
+    return pl;
+  }
+
+  async removeTracksFromPlaylist(
+    playlistId: number,
+    trackIds: number[],
+  ): Promise<DevicePlaylist> {
+    if (this.state.status !== "connected") throw new Error("No active device");
+    const session = this.state.data;
+    const pl = session.library.playlists.find((p) => p.id === playlistId);
+    if (!pl) throw new Error("Playlist not found");
+    pl.trackIds = pl.trackIds.filter((id) => !trackIds.includes(id));
+    this.state = {
+      ...this.state,
+      data: {
+        ...session,
+        library: {
+          ...session.library,
+          playlists: [...session.library.playlists],
+        },
+      },
+    };
+    return pl;
+  }
+
+  async renameDevicePlaylist(
+    playlistId: number,
+    newName: string,
+  ): Promise<DevicePlaylist> {
+    if (this.state.status !== "connected") throw new Error("No active device");
+    const session = this.state.data;
+    const pl = session.library.playlists.find((p) => p.id === playlistId);
+    if (!pl) throw new Error("Playlist not found");
+    pl.name = newName;
+    this.state = {
+      ...this.state,
+      data: {
+        ...session,
+        library: {
+          ...session.library,
+          playlists: [...session.library.playlists],
+        },
+      },
+    };
+    return pl;
+  }
+
+  async deleteDevicePlaylist(playlistId: number): Promise<void> {
+    if (this.state.status !== "connected") throw new Error("No active device");
+    const session = this.state.data;
+    session.library.playlists = session.library.playlists.filter(
+      (p) => p.id !== playlistId,
+    );
+    this.state = {
+      ...this.state,
+      data: {
+        ...session,
+        library: {
+          ...session.library,
+          playlists: [...session.library.playlists],
+        },
+      },
+    };
   }
 }
 
@@ -865,5 +1073,158 @@ describe("PodLoaderBridge React UI Seam", () => {
       expect(flacTranscoded?.obfuscatedPath).toMatch(/\.m4a$/);
       expect(oggTranscoded?.obfuscatedPath).toMatch(/\.m4a$/);
     }
+  });
+
+  test("allows user to edit track metadata, stage removals, commit edits/removals, and manage user playlists (create, rename, delete)", async () => {
+    const user = userEvent.setup();
+    const bridge = new InMemoryPodLoaderBridge({
+      status: "connected",
+      data: {
+        device: {
+          mountPath: "/mnt/ipod",
+          name: "Classic 80GB",
+          modelNumber: "MB147",
+          firewireGuid: "000A27001358762E",
+          totalBytes: 80_000_000_000,
+          freeBytes: 70_000_000_000,
+          usedBytes: 10_000_000_000,
+        },
+        library: {
+          tracks: [
+            {
+              id: 101,
+              title: "Original Title",
+              artist: "Original Artist",
+              album: "Original Album",
+              trackNumber: 1,
+              discNumber: 1,
+              genre: "Rock",
+              year: 2001,
+              durationMs: 240_000,
+              bitrateKbps: 320,
+              playCount: 5,
+              rating: 60,
+              bookmarkMs: 0,
+              obfuscatedPath: ":iPod_Control:Music:F00:ABCD.mp3",
+            },
+            {
+              id: 102,
+              title: "Second Song",
+              artist: "Second Artist",
+              album: "Second Album",
+              trackNumber: 2,
+              discNumber: 1,
+              genre: "Pop",
+              year: 2002,
+              durationMs: 180_000,
+              bitrateKbps: 256,
+              playCount: 10,
+              rating: 80,
+              bookmarkMs: 0,
+              obfuscatedPath: ":iPod_Control:Music:F00:EFGH.mp3",
+            },
+          ],
+          playlists: [
+            {
+              id: 1,
+              name: "Classic 80GB",
+              kind: "master",
+              trackIds: [101, 102],
+            },
+          ],
+        },
+        hasPendingPlayCounts: false,
+        syncBatch: { additions: [], edits: [], removals: [], requiredBytes: 0 },
+        interruptedBatch: null,
+      },
+    });
+
+    render(<App bridge={bridge} />);
+
+    // Verify initial tracks rendered
+    const tracksTable = await screen.findByRole("table", { name: /Device Tracks/i });
+    expect(within(tracksTable).getByText("Original Title")).toBeInTheDocument();
+    expect(within(tracksTable).getByText("Second Song")).toBeInTheDocument();
+
+    // 1. Single Track Metadata Editing
+    const selectTrack1 = screen.getByRole("checkbox", { name: /Select Original Title/i });
+    await user.click(selectTrack1);
+
+    const editMetadataBtn = screen.getByRole("button", { name: /Edit Metadata/i });
+    await user.click(editMetadataBtn);
+
+    const editModal = await screen.findByRole("dialog", { name: /Edit Track Metadata/i });
+    const titleInput = within(editModal).getByLabelText(/Title/i);
+    await user.clear(titleInput);
+    await user.type(titleInput, "Edited Title");
+
+    const yearInput = within(editModal).getByLabelText(/Year/i);
+    await user.clear(yearInput);
+    await user.type(yearInput, "2024");
+
+    const stageEditsBtn = within(editModal).getByRole("button", { name: /Stage Edits/i });
+    await user.click(stageEditsBtn);
+
+    // Verify Staged Edits appear in Sync Batch
+    const syncBatchRegion = await screen.findByRole("region", { name: /Sync Batch/i });
+    expect(within(syncBatchRegion).getByText(/Edit: Edited Title/i)).toBeInTheDocument();
+
+    // 2. Track Removal
+    const selectTrack2 = screen.getByRole("checkbox", { name: /Select Second Song/i });
+    await user.click(selectTrack2);
+
+    const removeBtn = screen.getByRole("button", { name: /Remove from iPod/i });
+    await user.click(removeBtn);
+
+    expect(within(syncBatchRegion).getByText(/Remove: Second Song/i)).toBeInTheDocument();
+
+    // 3. Commit Edits and Removals
+    const commitBtn = within(syncBatchRegion).getByRole("button", { name: /Commit Sync Batch/i });
+    await user.click(commitBtn);
+
+    // Verify table updated
+    expect(within(tracksTable).getByText("Edited Title")).toBeInTheDocument();
+    expect(within(tracksTable).getByText("2024")).toBeInTheDocument();
+    expect(within(tracksTable).queryByText("Second Song")).not.toBeInTheDocument();
+
+    // 4. User Playlist Management (Create, Add Track, Rename, Delete)
+    const newPlaylistBtn = screen.getByRole("button", { name: /New Playlist/i });
+    await user.click(newPlaylistBtn);
+
+    const playlistNameInput = await screen.findByLabelText(/New Playlist Name/i);
+    await user.type(playlistNameInput, "Road Trip");
+    await user.click(screen.getByRole("button", { name: /Create Playlist/i }));
+
+    // Verify Playlist in sidebar
+    const playlistsSection = screen.getByRole("navigation", { name: /Device Playlists/i });
+    expect(within(playlistsSection).getByText(/Road Trip/i)).toBeInTheDocument();
+
+    // Select Master playlist to browse tracks and add to Road Trip
+    await user.click(screen.getByRole("button", { name: /Classic 80GB/i }));
+
+    // Add selected track to playlist via toolbar
+    const selectTrackEdited = screen.getByRole("checkbox", { name: /Select Edited Title/i });
+    await user.click(selectTrackEdited);
+    const addToPlaylistBtn = screen.getByRole("button", { name: /Add to Playlist/i });
+    await user.click(addToPlaylistBtn);
+
+    // Verify track added to playlist
+    expect(within(playlistsSection).getByText(/Road Trip \(1\)/i)).toBeInTheDocument();
+
+    // Rename Playlist
+    const renameBtn = screen.getByRole("button", { name: /^Rename$/i });
+    await user.click(renameBtn);
+    const renameInput = await screen.findByLabelText(/Rename Playlist/i);
+    await user.clear(renameInput);
+    await user.type(renameInput, "Summer Road Trip");
+    await user.click(screen.getByRole("button", { name: /Save Rename/i }));
+
+    expect(within(playlistsSection).getByText(/Summer Road Trip/i)).toBeInTheDocument();
+
+    // Delete Playlist
+    const deleteBtn = screen.getByRole("button", { name: /^Delete$/i });
+    await user.click(deleteBtn);
+
+    expect(within(playlistsSection).queryByText(/Summer Road Trip/i)).not.toBeInTheDocument();
   });
 });

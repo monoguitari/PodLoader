@@ -334,6 +334,7 @@ impl ItunesDb {
                         chunk.track.title = host_file.title.clone();
                         chunk.track.artist = host_file.artist.clone();
                         chunk.track.album = host_file.album.clone();
+                        chunk.track.album_artist = Some(host_file.artist.clone());
                         chunk.track.genre = host_file.genre.clone();
                         chunk.track.track_number = host_file.track_number;
                         chunk.track.disc_number = host_file.disc_number;
@@ -386,6 +387,164 @@ impl ItunesDb {
         (new_id, None)
     }
 
+    pub fn update_track_metadata(
+        &mut self,
+        track_id: u32,
+        edits: &crate::TrackMetadataEdits,
+    ) -> Result<Option<(String, DeviceTrack)>, PodLoaderError> {
+        let mut target_track: Option<(String, DeviceTrack)> = None;
+
+        for ds in &mut self.datasets {
+            if let MhsdBody::TrackList { tracks, .. } = &mut ds.body {
+                if let Some(chunk) = tracks.iter_mut().find(|c| c.track.id == track_id) {
+                    if let Some(ref t) = edits.title {
+                        chunk.track.title = t.clone();
+                    }
+                    if let Some(ref a) = edits.artist {
+                        chunk.track.artist = a.clone();
+                    }
+                    if let Some(ref alb) = edits.album {
+                        chunk.track.album = alb.clone();
+                    }
+                    if let Some(ref aa) = edits.album_artist {
+                        chunk.track.album_artist = Some(aa.clone());
+                    }
+                    if let Some(tn) = edits.track_number {
+                        chunk.track.track_number = tn;
+                    }
+                    if let Some(dn) = edits.disc_number {
+                        chunk.track.disc_number = dn;
+                    }
+                    if let Some(ref g) = edits.genre {
+                        chunk.track.genre = g.clone();
+                    }
+                    if let Some(y) = edits.year {
+                        chunk.track.year = y;
+                    }
+                    if let Some(comp) = edits.is_compilation {
+                        chunk.track.is_compilation = comp;
+                    }
+                    if let Some(r) = edits.rating {
+                        chunk.track.rating = r.min(5);
+                    }
+
+                    if chunk.header_bytes.len() >= 96 {
+                        if let Some(r) = edits.rating {
+                            chunk.header_bytes[30] = (r.min(5)) * 20;
+                        }
+                        if let Some(comp) = edits.is_compilation {
+                            chunk.header_bytes[31] = if comp { 1 } else { 0 };
+                        }
+                        if let Some(tn) = edits.track_number {
+                            chunk.header_bytes[44..48].copy_from_slice(&tn.to_le_bytes());
+                        }
+                        if let Some(y) = edits.year {
+                            chunk.header_bytes[52..56].copy_from_slice(&y.to_le_bytes());
+                        }
+                        if let Some(dn) = edits.disc_number {
+                            chunk.header_bytes[92..96].copy_from_slice(&dn.to_le_bytes());
+                        }
+                    }
+
+                    for m in &mut chunk.mhods {
+                        match m.mhod_type {
+                            1 if edits.title.is_some() => {
+                                m.raw_bytes = encode_string_mhod(1, &chunk.track.title);
+                            }
+                            3 if edits.album.is_some() => {
+                                m.raw_bytes = encode_string_mhod(3, &chunk.track.album);
+                            }
+                            4 if edits.artist.is_some() => {
+                                m.raw_bytes = encode_string_mhod(4, &chunk.track.artist);
+                            }
+                            5 if edits.genre.is_some() => {
+                                m.raw_bytes = encode_string_mhod(5, &chunk.track.genre);
+                            }
+                            22 if edits.album_artist.is_some() || edits.artist.is_some() => {
+                                let aa = chunk
+                                    .track
+                                    .album_artist
+                                    .as_deref()
+                                    .unwrap_or(&chunk.track.artist);
+                                m.raw_bytes = encode_string_mhod(22, aa);
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if edits.album_artist.is_some()
+                        && !chunk.mhods.iter().any(|m| m.mhod_type == 22)
+                    {
+                        let aa = chunk
+                            .track
+                            .album_artist
+                            .as_deref()
+                            .unwrap_or(&chunk.track.artist);
+                        chunk.mhods.push(MhodChunk {
+                            mhod_type: 22,
+                            raw_bytes: encode_string_mhod(22, aa),
+                        });
+                    }
+
+                    let header_len = if chunk.header_bytes.len() >= 8 {
+                        u32::from_le_bytes(chunk.header_bytes[4..8].try_into().unwrap_or([0; 4]))
+                    } else {
+                        chunk.header_bytes.len() as u32
+                    };
+                    let mhods_len: usize = chunk.mhods.iter().map(|m| m.raw_bytes.len()).sum();
+                    let new_total_len = (header_len as usize + mhods_len) as u32;
+                    if chunk.header_bytes.len() >= 16 {
+                        chunk.header_bytes[8..12].copy_from_slice(&new_total_len.to_le_bytes());
+                        chunk.header_bytes[12..16]
+                            .copy_from_slice(&(chunk.mhods.len() as u32).to_le_bytes());
+                    }
+
+                    target_track = Some((chunk.track.obfuscated_path.clone(), chunk.track.clone()));
+                    break;
+                }
+            }
+        }
+
+        Ok(target_track)
+    }
+
+    pub fn remove_tracks(&mut self, track_ids: &[u32]) -> Result<Vec<String>, PodLoaderError> {
+        let mut removed_paths: Vec<String> = Vec::new();
+
+        // 1. Remove from datasets -> TrackList
+        for ds in &mut self.datasets {
+            if let MhsdBody::TrackList {
+                tracks,
+                mhlt_header_bytes,
+            } = &mut ds.body
+            {
+                for chunk in tracks.iter() {
+                    if track_ids.contains(&chunk.track.id) {
+                        removed_paths.push(chunk.track.obfuscated_path.clone());
+                    }
+                }
+                tracks.retain(|chunk| !track_ids.contains(&chunk.track.id));
+                if mhlt_header_bytes.len() >= 12 {
+                    mhlt_header_bytes[8..12]
+                        .copy_from_slice(&(tracks.len() as u32).to_le_bytes());
+                }
+            }
+        }
+
+        // 2. Remove from datasets -> PlaylistList (Master and all User playlists)
+        for ds in &mut self.datasets {
+            if let MhsdBody::PlaylistList { playlists, .. } = &mut ds.body {
+                for pl in playlists.iter_mut() {
+                    pl.mhips.retain(|mhip| !track_ids.contains(&mhip.track_id));
+                    pl.playlist.track_ids.retain(|id| !track_ids.contains(id));
+                    reindex_playlist_mhips(&mut pl.mhips);
+                }
+            }
+        }
+
+        Ok(removed_paths)
+    }
+
     fn append_track_to_playlists(
         &mut self,
         track_id: u32,
@@ -424,6 +583,214 @@ impl ItunesDb {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    fn playlist_list_mut(&mut self) -> Result<&mut Vec<MhypChunk>, PodLoaderError> {
+        let mut found_idx = None;
+        for (idx, ds) in self.datasets.iter().enumerate() {
+            if ds.dataset_type == 2 {
+                if let MhsdBody::PlaylistList { .. } = &ds.body {
+                    found_idx = Some(idx);
+                    break;
+                }
+            }
+        }
+        if found_idx.is_none() {
+            for (idx, ds) in self.datasets.iter().enumerate() {
+                if let MhsdBody::PlaylistList { .. } = &ds.body {
+                    found_idx = Some(idx);
+                    break;
+                }
+            }
+        }
+
+        if let Some(idx) = found_idx {
+            if let MhsdBody::PlaylistList { playlists, .. } = &mut self.datasets[idx].body {
+                return Ok(playlists);
+            }
+        }
+        Err(PodLoaderError::DeviceOperationFailed(
+            "No playlist dataset found in iTunesDB".into(),
+        ))
+    }
+
+    pub fn create_user_playlist(&mut self, name: &str) -> Result<DevicePlaylist, PodLoaderError> {
+        let playlists = self.playlist_list_mut()?;
+        let max_id = playlists.iter().map(|p| p.playlist.id).max().unwrap_or(1000);
+        let new_id = if max_id < 1000 { 1001 } else { max_id + 1 };
+
+        let mut header_bytes = if let Some(first) = playlists.first() {
+            first.header_bytes.clone()
+        } else {
+            vec![0u8; 108]
+        };
+        let header_len = header_bytes.len() as u32;
+        header_bytes[0..4].copy_from_slice(b"mhyp");
+        header_bytes[4..8].copy_from_slice(&header_len.to_le_bytes());
+        if header_bytes.len() > 20 {
+            header_bytes[20] = 0; // Not master
+        }
+        if header_bytes.len() >= 36 {
+            header_bytes[28..36].copy_from_slice(&new_id.to_le_bytes());
+        }
+
+        let name_mhod = MhodChunk {
+            mhod_type: 1,
+            raw_bytes: encode_string_mhod(1, name),
+        };
+
+        let dev_pl = DevicePlaylist {
+            id: new_id,
+            name: name.to_string(),
+            kind: PlaylistKind::User,
+            track_ids: Vec::new(),
+        };
+
+        let chunk = MhypChunk {
+            header_bytes,
+            mhods: vec![name_mhod],
+            mhips: Vec::new(),
+            playlist: dev_pl.clone(),
+        };
+
+        playlists.push(chunk);
+        Ok(dev_pl)
+    }
+
+    pub fn add_tracks_to_playlist(
+        &mut self,
+        playlist_id: u64,
+        track_ids: &[u32],
+    ) -> Result<DevicePlaylist, PodLoaderError> {
+        let playlists = self.playlist_list_mut()?;
+        let pl = playlists
+            .iter_mut()
+            .find(|p| p.playlist.id == playlist_id)
+            .ok_or_else(|| {
+                PodLoaderError::DeviceOperationFailed(format!("Playlist {} not found", playlist_id))
+            })?;
+
+        for &track_id in track_ids {
+            let next_pos = (pl.mhips.len() as u32) + 1;
+            pl.mhips.push(build_new_mhip_chunk(track_id, next_pos));
+            pl.playlist.track_ids.push(track_id);
+        }
+        Ok(pl.playlist.clone())
+    }
+
+    pub fn reorder_playlist_tracks(
+        &mut self,
+        playlist_id: u64,
+        track_ids: &[u32],
+    ) -> Result<DevicePlaylist, PodLoaderError> {
+        let playlists = self.playlist_list_mut()?;
+        let pl = playlists
+            .iter_mut()
+            .find(|p| p.playlist.id == playlist_id)
+            .ok_or_else(|| {
+                PodLoaderError::DeviceOperationFailed(format!("Playlist {} not found", playlist_id))
+            })?;
+
+        let mut remaining = std::mem::take(&mut pl.mhips);
+        let mut reordered = Vec::with_capacity(remaining.len());
+        for tid in track_ids {
+            if let Some(idx) = remaining.iter().position(|m| m.track_id == *tid) {
+                reordered.push(remaining.remove(idx));
+            }
+        }
+        reordered.extend(remaining);
+        reindex_playlist_mhips(&mut reordered);
+        pl.playlist.track_ids = reordered.iter().map(|m| m.track_id).collect();
+        pl.mhips = reordered;
+        Ok(pl.playlist.clone())
+    }
+
+    pub fn remove_tracks_from_playlist(
+        &mut self,
+        playlist_id: u64,
+        track_ids: &[u32],
+    ) -> Result<DevicePlaylist, PodLoaderError> {
+        let playlists = self.playlist_list_mut()?;
+        let pl = playlists
+            .iter_mut()
+            .find(|p| p.playlist.id == playlist_id)
+            .ok_or_else(|| {
+                PodLoaderError::DeviceOperationFailed(format!("Playlist {} not found", playlist_id))
+            })?;
+
+        pl.mhips.retain(|m| !track_ids.contains(&m.track_id));
+        reindex_playlist_mhips(&mut pl.mhips);
+        pl.playlist.track_ids = pl.mhips.iter().map(|m| m.track_id).collect();
+        Ok(pl.playlist.clone())
+    }
+
+    pub fn rename_device_playlist(
+        &mut self,
+        playlist_id: u64,
+        new_name: &str,
+    ) -> Result<DevicePlaylist, PodLoaderError> {
+        let playlists = self.playlist_list_mut()?;
+        let pl = playlists
+            .iter_mut()
+            .find(|p| p.playlist.id == playlist_id)
+            .ok_or_else(|| {
+                PodLoaderError::DeviceOperationFailed(format!("Playlist {} not found", playlist_id))
+            })?;
+
+        if pl.playlist.kind == PlaylistKind::Master || pl.playlist.kind == PlaylistKind::Smart {
+            return Err(PodLoaderError::DeviceOperationFailed(
+                "Cannot rename master or smart playlist".into(),
+            ));
+        }
+        pl.playlist.name = new_name.to_string();
+        let new_mhod_bytes = encode_string_mhod(1, new_name);
+        if let Some(mhod) = pl.mhods.iter_mut().find(|m| m.mhod_type == 1) {
+            mhod.raw_bytes = new_mhod_bytes;
+        } else {
+            pl.mhods.push(MhodChunk {
+                mhod_type: 1,
+                raw_bytes: new_mhod_bytes,
+            });
+        }
+        Ok(pl.playlist.clone())
+    }
+
+    pub fn delete_device_playlist(&mut self, playlist_id: u64) -> Result<(), PodLoaderError> {
+        let playlists = self.playlist_list_mut()?;
+        let pos = playlists
+            .iter()
+            .position(|p| p.playlist.id == playlist_id)
+            .ok_or_else(|| {
+                PodLoaderError::DeviceOperationFailed(format!("Playlist {} not found", playlist_id))
+            })?;
+
+        if playlists[pos].playlist.kind == PlaylistKind::Master {
+            return Err(PodLoaderError::DeviceOperationFailed(
+                "Cannot delete master playlist".into(),
+            ));
+        }
+        if playlists[pos].playlist.kind == PlaylistKind::Smart {
+            return Err(PodLoaderError::DeviceOperationFailed(
+                "Cannot delete smart playlist".into(),
+            ));
+        }
+        playlists.remove(pos);
+        Ok(())
+    }
+}
+
+fn reindex_playlist_mhips(mhips: &mut [MhipChunk]) {
+    for (pos, mhip) in mhips.iter_mut().enumerate() {
+        let new_pos = (pos + 1) as u32;
+        mhip.order_position = Some(new_pos);
+        if mhip.header_bytes.len() >= 40 {
+            mhip.header_bytes[36..40].copy_from_slice(&new_pos.to_le_bytes());
+        }
+        for mhod in &mut mhip.mhods {
+            if mhod.mhod_type == 100 && mhod.raw_bytes.len() >= 28 {
+                mhod.raw_bytes[24..28].copy_from_slice(&new_pos.to_le_bytes());
             }
         }
     }
@@ -888,6 +1255,8 @@ fn build_new_mhit_chunk(
             last_played_timestamp: None,
             bookmark_ms: 0,
             obfuscated_path: obfuscated_path.to_string(),
+            album_artist: Some(host_file.artist.clone()),
+            is_compilation: false,
         },
     }
 }
@@ -1050,6 +1419,8 @@ fn parse_track_list_body(body: &[u8]) -> Result<MhsdBody, PodLoaderError> {
         let id = read_u32_le(&header_bytes, 16)?;
         let raw_rating = header_bytes.get(30).copied().unwrap_or(0);
         let rating = (raw_rating / 20).min(5);
+        let raw_compilation = header_bytes.get(31).copied().unwrap_or(0);
+        let is_compilation = raw_compilation != 0;
         let duration_ms = read_u32_le(&header_bytes, 40).unwrap_or(0);
         let track_number = read_u32_le(&header_bytes, 44).unwrap_or(0);
         let year = read_u32_le(&header_bytes, 52).unwrap_or(0);
@@ -1069,6 +1440,7 @@ fn parse_track_list_body(body: &[u8]) -> Result<MhsdBody, PodLoaderError> {
         let mut title = String::new();
         let mut artist = String::new();
         let mut album = String::new();
+        let mut album_artist = None;
         let mut genre = String::new();
         let mut obfuscated_path = String::new();
 
@@ -1100,6 +1472,11 @@ fn parse_track_list_body(body: &[u8]) -> Result<MhsdBody, PodLoaderError> {
                         genre = s;
                     }
                 }
+                22 => {
+                    if let Some(s) = decode_mhod_string(&mhod.raw_bytes) {
+                        album_artist = Some(s);
+                    }
+                }
                 _ => {}
             }
             mhods.push(mhod);
@@ -1125,6 +1502,8 @@ fn parse_track_list_body(body: &[u8]) -> Result<MhsdBody, PodLoaderError> {
                 last_played_timestamp,
                 bookmark_ms,
                 obfuscated_path,
+                album_artist,
+                is_compilation,
             },
         });
 

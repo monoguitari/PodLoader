@@ -5,6 +5,7 @@ pub mod itunesdb;
 pub mod playcounts;
 pub mod signing;
 pub mod sysinfo;
+pub mod tagging;
 pub mod transcode;
 
 use std::cell::RefCell;
@@ -53,6 +54,8 @@ pub enum PodLoaderError {
     FfmpegUnavailable,
     #[error("Transcode failed: {0}")]
     TranscodeFailed(String),
+    #[error("Device operation failed: {0}")]
+    DeviceOperationFailed(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -322,6 +325,10 @@ pub struct DeviceTrack {
     pub last_played_timestamp: Option<u32>,
     pub bookmark_ms: u32,
     pub obfuscated_path: String,
+    #[serde(default)]
+    pub album_artist: Option<String>,
+    #[serde(default)]
+    pub is_compilation: bool,
 }
 
 impl DeviceTrack {
@@ -395,8 +402,44 @@ impl StagedTrackAddition {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TrackMetadataEdits {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub album_artist: Option<String>,
+    pub track_number: Option<u32>,
+    pub disc_number: Option<u32>,
+    pub genre: Option<String>,
+    pub year: Option<u32>,
+    pub is_compilation: Option<bool>,
+    pub rating: Option<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StagedMetadataEdit {
+    pub staged_id: u64,
+    pub track_id: u32,
+    pub edits: TrackMetadataEdits,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StagedTrackRemoval {
+    pub staged_id: u64,
+    pub track_id: u32,
+    pub track_title: String,
+    pub track_artist: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SyncBatch {
     pub additions: Vec<StagedTrackAddition>,
+    #[serde(default)]
+    pub edits: Vec<StagedMetadataEdit>,
+    #[serde(default)]
+    pub removals: Vec<StagedTrackRemoval>,
     pub required_bytes: u64,
 }
 
@@ -649,6 +692,60 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
             item.duplicate_resolution = resolution;
         }
         recalculate_required_bytes(&mut st.sync_batch);
+        Ok(st.sync_batch.clone())
+    }
+
+    pub fn stage_track_metadata_edits(
+        &mut self,
+        track_ids: &[u32],
+        edits: TrackMetadataEdits,
+    ) -> Result<SyncBatch, PodLoaderError> {
+        let current = match self.scan_device()? {
+            DeviceConnectionState::Connected(session) => session,
+            _ => return Err(PodLoaderError::NoActiveDevice),
+        };
+        let mut st = self.state.borrow_mut();
+        for &tid in track_ids {
+            if current.library.tracks.iter().any(|t| t.id == tid) {
+                if let Some(existing) = st.sync_batch.edits.iter_mut().find(|e| e.track_id == tid) {
+                    merge_edits(&mut existing.edits, &edits);
+                } else {
+                    let staged_id = st.next_staged_id;
+                    st.next_staged_id += 1;
+                    st.sync_batch.edits.push(StagedMetadataEdit {
+                        staged_id,
+                        track_id: tid,
+                        edits: edits.clone(),
+                    });
+                }
+            }
+        }
+        Ok(st.sync_batch.clone())
+    }
+
+    pub fn stage_track_removals(
+        &mut self,
+        track_ids: &[u32],
+    ) -> Result<SyncBatch, PodLoaderError> {
+        let current = match self.scan_device()? {
+            DeviceConnectionState::Connected(session) => session,
+            _ => return Err(PodLoaderError::NoActiveDevice),
+        };
+        let mut st = self.state.borrow_mut();
+        for &tid in track_ids {
+            if let Some(track) = current.library.tracks.iter().find(|t| t.id == tid) {
+                if !st.sync_batch.removals.iter().any(|r| r.track_id == tid) {
+                    let staged_id = st.next_staged_id;
+                    st.next_staged_id += 1;
+                    st.sync_batch.removals.push(StagedTrackRemoval {
+                        staged_id,
+                        track_id: tid,
+                        track_title: track.title.clone(),
+                        track_artist: track.artist.clone(),
+                    });
+                }
+            }
+        }
         Ok(st.sync_batch.clone())
     }
 
@@ -936,6 +1033,30 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
             return Ok(CommitOutcome::Interrupted(summary));
         }
 
+        // Apply staged metadata edits
+        let staged_edits = self.state.borrow().sync_batch.edits.clone();
+        for edit in &staged_edits {
+            if let Ok(Some((obfuscated_path, updated_track))) =
+                parsed_db.update_track_metadata(edit.track_id, &edit.edits)
+            {
+                let disk_path = obfuscated_to_disk_path(&mount_path, &obfuscated_path);
+                if disk_path.is_file() {
+                    let _ = tagging::update_audio_file_tags(&disk_path, &edit.edits, &updated_track);
+                }
+            }
+        }
+
+        // Apply staged track removals
+        let staged_removals = self.state.borrow().sync_batch.removals.clone();
+        if !staged_removals.is_empty() {
+            let removal_ids: Vec<u32> = staged_removals.iter().map(|r| r.track_id).collect();
+            let paths_to_delete = parsed_db.remove_tracks(&removal_ids)?;
+            for obf in paths_to_delete {
+                let disk_path = obfuscated_to_disk_path(&mount_path, &obf);
+                old_paths_to_remove.push(disk_path);
+            }
+        }
+
         finalize_itunesdb_commit(
             &mount_path,
             &original_db_bytes,
@@ -1113,6 +1234,73 @@ impl<A: HardwareDeviceAdapter> PodLoaderEngine<A> {
             ffmpeg_available: self.adapter.is_ffmpeg_available(),
         }))
     }
+
+    fn mutate_itunesdb<F, R>(&mut self, f: F) -> Result<R, PodLoaderError>
+    where
+        F: FnOnce(&mut ItunesDb) -> Result<R, PodLoaderError>,
+    {
+        let current = match self.scan_device()? {
+            DeviceConnectionState::Connected(session) => session,
+            _ => return Err(PodLoaderError::NoActiveDevice),
+        };
+        let mount_path = current.device.mount_path;
+        let itunesdb_path = mount_path
+            .join("iPod_Control")
+            .join("iTunes")
+            .join("iTunesDB");
+        let original_db_bytes = fs::read(&itunesdb_path)?;
+        let mut parsed_db = ItunesDb::parse(&original_db_bytes)?;
+        let result = f(&mut parsed_db)?;
+        finalize_itunesdb_commit(
+            &mount_path,
+            &original_db_bytes,
+            &mut parsed_db,
+            current.device.firewire_guid.as_deref(),
+            &[],
+        )?;
+        let _ = self.scan_device()?;
+        Ok(result)
+    }
+
+    pub fn create_device_playlist(&mut self, name: &str) -> Result<DevicePlaylist, PodLoaderError> {
+        self.mutate_itunesdb(|db| db.create_user_playlist(name))
+    }
+
+    pub fn add_tracks_to_playlist(
+        &mut self,
+        playlist_id: u64,
+        track_ids: &[u32],
+    ) -> Result<DevicePlaylist, PodLoaderError> {
+        self.mutate_itunesdb(|db| db.add_tracks_to_playlist(playlist_id, track_ids))
+    }
+
+    pub fn reorder_playlist_tracks(
+        &mut self,
+        playlist_id: u64,
+        track_ids: &[u32],
+    ) -> Result<DevicePlaylist, PodLoaderError> {
+        self.mutate_itunesdb(|db| db.reorder_playlist_tracks(playlist_id, track_ids))
+    }
+
+    pub fn remove_tracks_from_playlist(
+        &mut self,
+        playlist_id: u64,
+        track_ids: &[u32],
+    ) -> Result<DevicePlaylist, PodLoaderError> {
+        self.mutate_itunesdb(|db| db.remove_tracks_from_playlist(playlist_id, track_ids))
+    }
+
+    pub fn rename_device_playlist(
+        &mut self,
+        playlist_id: u64,
+        new_name: &str,
+    ) -> Result<DevicePlaylist, PodLoaderError> {
+        self.mutate_itunesdb(|db| db.rename_device_playlist(playlist_id, new_name))
+    }
+
+    pub fn delete_device_playlist(&mut self, playlist_id: u64) -> Result<(), PodLoaderError> {
+        self.mutate_itunesdb(|db| db.delete_device_playlist(playlist_id))
+    }
 }
 
 fn finalize_itunesdb_commit(
@@ -1258,4 +1446,37 @@ fn atomic_write_file(target_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let _ = fs::remove_file(&tmp_path);
     }
     Ok(())
+}
+
+fn merge_edits(target: &mut TrackMetadataEdits, incoming: &TrackMetadataEdits) {
+    if incoming.title.is_some() {
+        target.title = incoming.title.clone();
+    }
+    if incoming.artist.is_some() {
+        target.artist = incoming.artist.clone();
+    }
+    if incoming.album.is_some() {
+        target.album = incoming.album.clone();
+    }
+    if incoming.album_artist.is_some() {
+        target.album_artist = incoming.album_artist.clone();
+    }
+    if incoming.track_number.is_some() {
+        target.track_number = incoming.track_number;
+    }
+    if incoming.disc_number.is_some() {
+        target.disc_number = incoming.disc_number;
+    }
+    if incoming.genre.is_some() {
+        target.genre = incoming.genre.clone();
+    }
+    if incoming.year.is_some() {
+        target.year = incoming.year;
+    }
+    if incoming.is_compilation.is_some() {
+        target.is_compilation = incoming.is_compilation;
+    }
+    if incoming.rating.is_some() {
+        target.rating = incoming.rating;
+    }
 }

@@ -4,12 +4,14 @@ import { App } from "./App";
 import type {
   CommitOutcome,
   DeviceConnectionState,
+  DevicePlaylist,
   DeviceSession,
   DuplicateResolution,
   HostDirectoryListing,
   InterruptedResolution,
   PodLoaderBridge,
   SyncBatch,
+  TrackMetadataEdits,
   TranscodePreset,
   TransferProgress,
 } from "./bridge";
@@ -201,6 +203,104 @@ const defaultBridge: PodLoaderBridge = {
       );
     }
     return postJson<DeviceSession>("/api/set_transcode_preset", { preset });
+  },
+  async stageTrackMetadataEdits(
+    edits: Array<{ trackId: number; edits: TrackMetadataEdits }>,
+  ): Promise<SyncBatch> {
+    if (window.__TAURI_INTERNALS__) {
+      return window.__TAURI_INTERNALS__.invoke<SyncBatch>(
+        "stage_track_metadata_edits",
+        { edits },
+      );
+    }
+    return postJson<SyncBatch>("/api/stage_track_metadata_edits", { edits });
+  },
+  async stageTrackRemovals(trackIds: number[]): Promise<SyncBatch> {
+    if (window.__TAURI_INTERNALS__) {
+      return window.__TAURI_INTERNALS__.invoke<SyncBatch>(
+        "stage_track_removals",
+        { trackIds },
+      );
+    }
+    return postJson<SyncBatch>("/api/stage_track_removals", { trackIds });
+  },
+  async createDevicePlaylist(name: string): Promise<DevicePlaylist> {
+    if (window.__TAURI_INTERNALS__) {
+      return window.__TAURI_INTERNALS__.invoke<DevicePlaylist>(
+        "create_device_playlist",
+        { name },
+      );
+    }
+    return postJson<DevicePlaylist>("/api/create_device_playlist", { name });
+  },
+  async addTracksToPlaylist(
+    playlistId: number,
+    trackIds: number[],
+  ): Promise<DevicePlaylist> {
+    if (window.__TAURI_INTERNALS__) {
+      return window.__TAURI_INTERNALS__.invoke<DevicePlaylist>(
+        "add_tracks_to_playlist",
+        { playlistId, trackIds },
+      );
+    }
+    return postJson<DevicePlaylist>("/api/add_tracks_to_playlist", {
+      playlistId,
+      trackIds,
+    });
+  },
+  async reorderPlaylistTracks(
+    playlistId: number,
+    trackIds: number[],
+  ): Promise<DevicePlaylist> {
+    if (window.__TAURI_INTERNALS__) {
+      return window.__TAURI_INTERNALS__.invoke<DevicePlaylist>(
+        "reorder_playlist_tracks",
+        { playlistId, trackIds },
+      );
+    }
+    return postJson<DevicePlaylist>("/api/reorder_playlist_tracks", {
+      playlistId,
+      trackIds,
+    });
+  },
+  async removeTracksFromPlaylist(
+    playlistId: number,
+    trackIds: number[],
+  ): Promise<DevicePlaylist> {
+    if (window.__TAURI_INTERNALS__) {
+      return window.__TAURI_INTERNALS__.invoke<DevicePlaylist>(
+        "remove_tracks_from_playlist",
+        { playlistId, trackIds },
+      );
+    }
+    return postJson<DevicePlaylist>("/api/remove_tracks_from_playlist", {
+      playlistId,
+      trackIds,
+    });
+  },
+  async renameDevicePlaylist(
+    playlistId: number,
+    newName: string,
+  ): Promise<DevicePlaylist> {
+    if (window.__TAURI_INTERNALS__) {
+      return window.__TAURI_INTERNALS__.invoke<DevicePlaylist>(
+        "rename_device_playlist",
+        { playlistId, newName },
+      );
+    }
+    return postJson<DevicePlaylist>("/api/rename_device_playlist", {
+      playlistId,
+      newName,
+    });
+  },
+  async deleteDevicePlaylist(playlistId: number): Promise<void> {
+    if (window.__TAURI_INTERNALS__) {
+      return window.__TAURI_INTERNALS__.invoke<void>(
+        "delete_device_playlist",
+        { playlistId },
+      );
+    }
+    return postJson<void>("/api/delete_device_playlist", { playlistId });
   },
 };
 

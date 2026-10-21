@@ -9,6 +9,7 @@ import type {
   InterruptedResolution,
   PodLoaderBridge,
   SyncBatch,
+  TrackMetadataEdits,
   TranscodePreset,
   TransferProgress,
 } from "./bridge";
@@ -39,6 +40,10 @@ interface PlaylistSectionProps {
   selectedPlaylistId?: number;
   onSelect: (id: number) => void;
   onDropPaths?: (paths: string[], targetPlaylistId: number | null) => void;
+  canManage?: boolean;
+  onRename?: (id: number, name: string) => void;
+  onDelete?: (id: number) => void;
+  onCreate?: (name: string) => void;
 }
 
 function extractDroppedPaths(dataTransfer: DataTransfer): string[] {
@@ -68,10 +73,70 @@ function PlaylistSection({
   selectedPlaylistId,
   onSelect,
   onDropPaths,
+  canManage,
+  onRename,
+  onDelete,
+  onCreate,
 }: PlaylistSectionProps) {
+  const [isCreating, setIsCreating] = useState(false);
+  const [newPlaylistName, setNewPlaylistName] = useState("");
+  const [renamingId, setRenamingId] = useState<number | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+
+  const handleStartCreate = () => {
+    setIsCreating(true);
+    setNewPlaylistName("");
+  };
+
+  const handleFinishCreate = () => {
+    if (newPlaylistName.trim() && onCreate) {
+      onCreate(newPlaylistName.trim());
+    }
+    setIsCreating(false);
+    setNewPlaylistName("");
+  };
+
+  const handleStartRename = (pl: DevicePlaylist) => {
+    setRenamingId(pl.id);
+    setRenameValue(pl.name);
+  };
+
+  const handleFinishRename = (id: number) => {
+    if (renameValue.trim() && onRename) {
+      onRename(id, renameValue.trim());
+    }
+    setRenamingId(null);
+    setRenameValue("");
+  };
+
   return (
     <section>
       <h2>{title}</h2>
+      {canManage && (
+        <div className="playlist-create-bar">
+          {!isCreating ? (
+            <button type="button" onClick={handleStartCreate}>
+              New Playlist
+            </button>
+          ) : (
+            <div className="playlist-create-form">
+              <input
+                aria-label="New Playlist Name"
+                placeholder="Playlist name"
+                value={newPlaylistName}
+                onChange={(e) => setNewPlaylistName(e.target.value)}
+                autoFocus
+              />
+              <button type="button" onClick={handleFinishCreate}>
+                Create Playlist
+              </button>
+              <button type="button" onClick={() => setIsCreating(false)}>
+                Cancel
+              </button>
+            </div>
+          )}
+        </div>
+      )}
       <ul>
         {playlists.map((pl) => (
           <li
@@ -88,13 +153,52 @@ function PlaylistSection({
               }
             }}
           >
-            <button
-              type="button"
-              aria-pressed={selectedPlaylistId === pl.id}
-              onClick={() => onSelect(pl.id)}
-            >
-              {pl.name} ({pl.trackIds.length})
-            </button>
+            {renamingId === pl.id ? (
+              <div className="playlist-rename-form">
+                <input
+                  aria-label="Rename Playlist"
+                  value={renameValue}
+                  onChange={(e) => setRenameValue(e.target.value)}
+                  autoFocus
+                />
+                <button type="button" onClick={() => handleFinishRename(pl.id)}>
+                  Save Rename
+                </button>
+                <button type="button" onClick={() => setRenamingId(null)}>
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <div className="playlist-item-row">
+                <button
+                  type="button"
+                  aria-pressed={selectedPlaylistId === pl.id}
+                  onClick={() => onSelect(pl.id)}
+                >
+                  {pl.name} ({pl.trackIds.length})
+                </button>
+                {canManage && (
+                  <div className="playlist-item-actions">
+                    <button
+                      type="button"
+                      aria-label="Rename"
+                      title={`Rename ${pl.name}`}
+                      onClick={() => handleStartRename(pl)}
+                    >
+                      Rename
+                    </button>
+                    <button
+                      type="button"
+                      aria-label="Delete"
+                      title={`Delete ${pl.name}`}
+                      onClick={() => onDelete && onDelete(pl.id)}
+                    >
+                      Delete
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
           </li>
         ))}
       </ul>
@@ -124,6 +228,21 @@ export function App({ bridge }: AppProps) {
     useState<TransferProgress | null>(null);
   const [manualGuidInput, setManualGuidInput] = useState<string>("");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  const [selectedTrackIds, setSelectedTrackIds] = useState<number[]>([]);
+  const [showEditModal, setShowEditModal] = useState<boolean>(false);
+  const [editTitle, setEditTitle] = useState<string>("");
+  const [editArtist, setEditArtist] = useState<string>("");
+  const [editAlbum, setEditAlbum] = useState<string>("");
+  const [editAlbumArtist, setEditAlbumArtist] = useState<string>("");
+  const [editTrackNumber, setEditTrackNumber] = useState<string>("");
+  const [editDiscNumber, setEditDiscNumber] = useState<string>("");
+  const [editGenre, setEditGenre] = useState<string>("");
+  const [editYear, setEditYear] = useState<string>("");
+  const [editRating, setEditRating] = useState<string>("");
+  const [editIsCompilation, setEditIsCompilation] = useState<boolean>(false);
+  const [compilationModified, setCompilationModified] = useState<boolean>(false);
+  const [targetPlaylistId, setTargetPlaylistId] = useState<number | null>(null);
 
   const applyConnectionState = useCallback((state: DeviceConnectionState) => {
     setConnection(state);
@@ -349,6 +468,192 @@ export function App({ bridge }: AppProps) {
     }
   };
 
+  const openEditModal = () => {
+    if (selectedTrackIds.length === 0 || connection.status !== "connected") return;
+    if (selectedTrackIds.length === 1) {
+      const tr = connection.data.library.tracks.find((t) => t.id === selectedTrackIds[0]);
+      if (tr) {
+        setEditTitle(tr.title);
+        setEditArtist(tr.artist);
+        setEditAlbum(tr.album);
+        setEditAlbumArtist(tr.albumArtist ?? tr.artist);
+        setEditTrackNumber(tr.trackNumber ? String(tr.trackNumber) : "");
+        setEditDiscNumber(tr.discNumber ? String(tr.discNumber) : "");
+        setEditGenre(tr.genre ?? "");
+        setEditYear(tr.year ? String(tr.year) : "");
+        const normalizedRating =
+          tr.rating !== undefined
+            ? tr.rating > 5
+              ? Math.round(tr.rating / 20)
+              : tr.rating
+            : 0;
+        setEditRating(String(Math.max(0, Math.min(5, normalizedRating))));
+        setEditIsCompilation(Boolean(tr.isCompilation));
+      }
+    } else {
+      setEditTitle("");
+      setEditArtist("");
+      setEditAlbum("");
+      setEditAlbumArtist("");
+      setEditTrackNumber("");
+      setEditDiscNumber("");
+      setEditGenre("");
+      setEditYear("");
+      setEditRating("");
+      setEditIsCompilation(false);
+    }
+    setCompilationModified(false);
+    setShowEditModal(true);
+  };
+
+  const handleSaveMetadataEdits = async () => {
+    if (!bridge.stageTrackMetadataEdits || selectedTrackIds.length === 0) return;
+    const edits: TrackMetadataEdits = {};
+    if (editTitle.trim()) edits.title = editTitle.trim();
+    if (editArtist.trim()) edits.artist = editArtist.trim();
+    if (editAlbum.trim()) edits.album = editAlbum.trim();
+    if (editAlbumArtist.trim()) edits.albumArtist = editAlbumArtist.trim();
+    if (editTrackNumber.trim()) edits.trackNumber = parseInt(editTrackNumber, 10);
+    if (editDiscNumber.trim()) edits.discNumber = parseInt(editDiscNumber, 10);
+    if (editGenre.trim()) edits.genre = editGenre.trim();
+    if (editYear.trim()) edits.year = parseInt(editYear, 10);
+    if (editRating.trim()) edits.rating = Math.max(0, Math.min(5, parseInt(editRating, 10)));
+    if (selectedTrackIds.length === 1 || compilationModified) {
+      edits.isCompilation = editIsCompilation;
+    }
+
+    const payload = selectedTrackIds.map((tid) => ({
+      trackId: tid,
+      edits,
+    }));
+    try {
+      const updatedBatch = await bridge.stageTrackMetadataEdits(payload);
+      setSyncBatch(updatedBatch);
+      setShowEditModal(false);
+      setSelectedTrackIds([]);
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleAddToPlaylist = async (playlistId: number) => {
+    if (!bridge.addTracksToPlaylist || selectedTrackIds.length === 0) return;
+    try {
+      await bridge.addTracksToPlaylist(playlistId, selectedTrackIds);
+      setSelectedTrackIds([]);
+      const updated = await bridge.scanDevice();
+      applyConnectionState(updated);
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleStageRemovals = async () => {
+    if (!bridge.stageTrackRemovals || selectedTrackIds.length === 0) return;
+    try {
+      const updatedBatch = await bridge.stageTrackRemovals(selectedTrackIds);
+      setSyncBatch(updatedBatch);
+      setSelectedTrackIds([]);
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleCreatePlaylist = async (name: string) => {
+    if (!bridge.createDevicePlaylist || !name.trim()) return;
+    try {
+      const created = await bridge.createDevicePlaylist(name.trim());
+      const updated = await bridge.scanDevice();
+      applyConnectionState(updated);
+      setSelectedPlaylistId(created.id);
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleRenamePlaylist = async (id: number, newName: string) => {
+    if (!bridge.renameDevicePlaylist || !newName.trim()) return;
+    try {
+      await bridge.renameDevicePlaylist(id, newName.trim());
+      const updated = await bridge.scanDevice();
+      applyConnectionState(updated);
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleDeletePlaylist = async (id: number) => {
+    if (!bridge.deleteDevicePlaylist) return;
+    try {
+      await bridge.deleteDevicePlaylist(id);
+      const updated = await bridge.scanDevice();
+      applyConnectionState(updated);
+      if (selectedPlaylistId === id) {
+        setSelectedPlaylistId(null);
+      }
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleMoveTrack = async (fromIdx: number, toIdx: number) => {
+    if (
+      !bridge.reorderPlaylistTracks ||
+      !selectedPlaylist ||
+      selectedPlaylist.kind !== "user"
+    ) {
+      return;
+    }
+    const currentIds = [...selectedPlaylist.trackIds];
+    if (
+      fromIdx < 0 ||
+      fromIdx >= currentIds.length ||
+      toIdx < 0 ||
+      toIdx >= currentIds.length
+    ) {
+      return;
+    }
+    const [moved] = currentIds.splice(fromIdx, 1);
+    currentIds.splice(toIdx, 0, moved);
+    try {
+      await bridge.reorderPlaylistTracks(selectedPlaylist.id, currentIds);
+      const updated = await bridge.scanDevice();
+      applyConnectionState(updated);
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleRemoveFromCurrentPlaylist = async () => {
+    if (
+      !bridge.removeTracksFromPlaylist ||
+      !selectedPlaylist ||
+      selectedPlaylist.kind !== "user" ||
+      selectedTrackIds.length === 0
+    ) {
+      return;
+    }
+    try {
+      await bridge.removeTracksFromPlaylist(
+        selectedPlaylist.id,
+        selectedTrackIds,
+      );
+      setSelectedTrackIds([]);
+      const updated = await bridge.scanDevice();
+      applyConnectionState(updated);
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
+
   return (
     <div className="podloader-shell">
       <header className="device-header">
@@ -549,6 +854,10 @@ export function App({ bridge }: AppProps) {
             onDropPaths={(paths, targetId) =>
               handleStagePaths(paths, targetId)
             }
+            canManage
+            onCreate={handleCreatePlaylist}
+            onRename={handleRenamePlaylist}
+            onDelete={handleDeletePlaylist}
           />
           <PlaylistSection
             title="Smart Playlists"
@@ -558,25 +867,38 @@ export function App({ bridge }: AppProps) {
           />
         </nav>
 
-        <main
-          className="track-pane"
-          aria-label="Device Library"
-          onDragOver={(e) => {
-            e.preventDefault();
-          }}
-          onDrop={(e) => {
-            e.preventDefault();
-            const paths = extractDroppedPaths(e.dataTransfer);
-            if (paths.length > 0) {
-              handleStagePaths(paths);
-            }
-          }}
-        >
-          {syncBatch.additions.length > 0 && (
+        {(() => {
+          const hasStagedItems =
+            syncBatch.additions.length > 0 ||
+            (syncBatch.edits && syncBatch.edits.length > 0) ||
+            (syncBatch.removals && syncBatch.removals.length > 0);
+          const totalStagedCount =
+            syncBatch.additions.length +
+            (syncBatch.edits?.length ?? 0) +
+            (syncBatch.removals?.length ?? 0);
+
+          return (
+            <main
+              className="track-pane"
+              aria-label="Device Library"
+              onDragOver={(e) => {
+                e.preventDefault();
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                const paths = extractDroppedPaths(e.dataTransfer);
+                if (paths.length > 0) {
+                  handleStagePaths(paths);
+                }
+              }}
+            >
+          {hasStagedItems && (
             <section aria-label="Sync Batch" className="sync-batch-panel">
               <h2>
-                Sync Batch ({syncBatch.additions.length} staged,{" "}
-                {formatGigabytes(syncBatch.requiredBytes)} required)
+                Sync Batch ({totalStagedCount} staged
+                {syncBatch.requiredBytes > 0
+                  ? `, ${formatGigabytes(syncBatch.requiredBytes)} required`
+                  : ""})
               </h2>
 
               {interruptedBatch && (
@@ -626,7 +948,7 @@ export function App({ bridge }: AppProps) {
                     "alac"
                   ).toUpperCase();
                   return (
-                    <li key={item.stagedId}>
+                    <li key={`addition-${item.stagedId}`}>
                       <span>
                         {item.hostFile.artist} — {item.hostFile.title} (
                         {item.requiresTranscode
@@ -658,6 +980,28 @@ export function App({ bridge }: AppProps) {
                     </li>
                   );
                 })}
+                {syncBatch.edits?.map((item) => {
+                  const tr =
+                    connection.status === "connected"
+                      ? connection.data.library.tracks.find(
+                          (t) => t.id === item.trackId,
+                        )
+                      : null;
+                  const label =
+                    item.edits.title ?? tr?.title ?? `Track #${item.trackId}`;
+                  return (
+                    <li key={`edit-${item.stagedId}`}>
+                      <span>Edit: {label}</span>
+                    </li>
+                  );
+                })}
+                {syncBatch.removals?.map((item) => (
+                  <li key={`removal-${item.stagedId}`}>
+                    <span>
+                      Remove: {item.trackTitle} ({item.trackArtist})
+                    </span>
+                  </li>
+                ))}
               </ul>
 
               <div className="sync-batch-actions">
@@ -678,9 +1022,82 @@ export function App({ bridge }: AppProps) {
             </section>
           )}
 
+          <div
+            className="track-toolbar"
+            role="toolbar"
+            aria-label="Track Actions"
+          >
+            <button
+              type="button"
+              disabled={selectedTrackIds.length === 0}
+              onClick={openEditModal}
+            >
+              Edit Metadata
+            </button>
+            <button
+              type="button"
+              disabled={selectedTrackIds.length === 0}
+              onClick={handleStageRemovals}
+            >
+              Remove from iPod
+            </button>
+            {selectedPlaylist?.kind === "user" && (
+              <button
+                type="button"
+                disabled={selectedTrackIds.length === 0}
+                onClick={handleRemoveFromCurrentPlaylist}
+              >
+                Remove from Playlist
+              </button>
+            )}
+            {userPlaylists.length > 0 && (
+              <div className="add-to-playlist-group">
+                <select
+                  aria-label="Target Playlist"
+                  value={targetPlaylistId ?? userPlaylists[0]?.id}
+                  onChange={(e) => setTargetPlaylistId(Number(e.target.value))}
+                >
+                  {userPlaylists.map((pl) => (
+                    <option key={pl.id} value={pl.id}>
+                      {pl.name}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  disabled={selectedTrackIds.length === 0}
+                  onClick={() =>
+                    handleAddToPlaylist(
+                      targetPlaylistId ?? userPlaylists[0]?.id,
+                    )
+                  }
+                >
+                  Add to Playlist
+                </button>
+              </div>
+            )}
+          </div>
+
           <table aria-label="Device Tracks">
             <thead>
               <tr>
+                <th>
+                  <input
+                    type="checkbox"
+                    aria-label="Select all tracks"
+                    checked={
+                      orderedTracks.length > 0 &&
+                      selectedTrackIds.length === orderedTracks.length
+                    }
+                    onChange={(e) => {
+                      if (e.target.checked) {
+                        setSelectedTrackIds(orderedTracks.map((t) => t.id));
+                      } else {
+                        setSelectedTrackIds([]);
+                      }
+                    }}
+                  />
+                </th>
                 <th>Title</th>
                 <th>Artist</th>
                 <th>Album</th>
@@ -692,11 +1109,28 @@ export function App({ bridge }: AppProps) {
                 <th>Bitrate</th>
                 <th>Play Count</th>
                 <th>Star Rating</th>
+                {selectedPlaylist?.kind === "user" && <th>Order</th>}
               </tr>
             </thead>
             <tbody>
-              {orderedTracks.map((track) => (
+              {orderedTracks.map((track, idx) => (
                 <tr key={track.id}>
+                  <td>
+                    <input
+                      type="checkbox"
+                      aria-label={`Select ${track.title}`}
+                      checked={selectedTrackIds.includes(track.id)}
+                      onChange={(e) => {
+                        if (e.target.checked) {
+                          setSelectedTrackIds((prev) => [...prev, track.id]);
+                        } else {
+                          setSelectedTrackIds((prev) =>
+                            prev.filter((id) => id !== track.id),
+                          );
+                        }
+                      }}
+                    />
+                  </td>
                   <td>{track.title}</td>
                   <td>{track.artist}</td>
                   <td>{track.album}</td>
@@ -708,12 +1142,168 @@ export function App({ bridge }: AppProps) {
                   <td>{track.bitrateKbps} kbps</td>
                   <td>{track.playCount}</td>
                   <td>{formatStarRating(track.rating)}</td>
+                  {selectedPlaylist?.kind === "user" && (
+                    <td>
+                      <button
+                        type="button"
+                        aria-label={`Move Up ${track.title}`}
+                        disabled={idx === 0}
+                        onClick={() => handleMoveTrack(idx, idx - 1)}
+                      >
+                        ↑
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`Move Down ${track.title}`}
+                        disabled={idx === orderedTracks.length - 1}
+                        onClick={() => handleMoveTrack(idx, idx + 1)}
+                      >
+                        ↓
+                      </button>
+                    </td>
+                  )}
                 </tr>
               ))}
             </tbody>
           </table>
         </main>
+      );
+    })()}
       </div>
+
+      {showEditModal && (
+        <div
+          role="dialog"
+          aria-label="Edit Track Metadata"
+          className="modal-overlay"
+        >
+          <div className="modal-content">
+            <h3>
+              Edit Track Metadata{" "}
+              {selectedTrackIds.length > 1
+                ? `(${selectedTrackIds.length} tracks)`
+                : ""}
+            </h3>
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                handleSaveMetadataEdits();
+              }}
+            >
+              <div>
+                <label htmlFor="edit-title">Title</label>
+                <input
+                  id="edit-title"
+                  aria-label="Title"
+                  value={editTitle}
+                  onChange={(e) => setEditTitle(e.target.value)}
+                />
+              </div>
+              <div>
+                <label htmlFor="edit-artist">Artist</label>
+                <input
+                  id="edit-artist"
+                  aria-label="Artist"
+                  value={editArtist}
+                  onChange={(e) => setEditArtist(e.target.value)}
+                />
+              </div>
+              <div>
+                <label htmlFor="edit-album">Album</label>
+                <input
+                  id="edit-album"
+                  aria-label="Album"
+                  value={editAlbum}
+                  onChange={(e) => setEditAlbum(e.target.value)}
+                />
+              </div>
+              <div>
+                <label htmlFor="edit-album-artist">Album Artist</label>
+                <input
+                  id="edit-album-artist"
+                  aria-label="Album Artist"
+                  value={editAlbumArtist}
+                  onChange={(e) => setEditAlbumArtist(e.target.value)}
+                />
+              </div>
+              <div>
+                <label htmlFor="edit-track-number">Track Number</label>
+                <input
+                  id="edit-track-number"
+                  aria-label="Track Number"
+                  type="number"
+                  value={editTrackNumber}
+                  onChange={(e) => setEditTrackNumber(e.target.value)}
+                />
+              </div>
+              <div>
+                <label htmlFor="edit-disc-number">Disc Number</label>
+                <input
+                  id="edit-disc-number"
+                  aria-label="Disc Number"
+                  type="number"
+                  value={editDiscNumber}
+                  onChange={(e) => setEditDiscNumber(e.target.value)}
+                />
+              </div>
+              <div>
+                <label htmlFor="edit-genre">Genre</label>
+                <input
+                  id="edit-genre"
+                  aria-label="Genre"
+                  value={editGenre}
+                  onChange={(e) => setEditGenre(e.target.value)}
+                />
+              </div>
+              <div>
+                <label htmlFor="edit-year">Year</label>
+                <input
+                  id="edit-year"
+                  aria-label="Year"
+                  type="number"
+                  value={editYear}
+                  onChange={(e) => setEditYear(e.target.value)}
+                />
+              </div>
+              <div>
+                <label htmlFor="edit-rating">Rating (0-5 stars)</label>
+                <input
+                  id="edit-rating"
+                  aria-label="Rating"
+                  type="number"
+                  min="0"
+                  max="5"
+                  placeholder="0 to 5"
+                  value={editRating}
+                  onChange={(e) => setEditRating(e.target.value)}
+                />
+              </div>
+              <div>
+                <label htmlFor="edit-is-compilation">Compilation</label>
+                <input
+                  id="edit-is-compilation"
+                  aria-label="Compilation"
+                  type="checkbox"
+                  checked={editIsCompilation}
+                  onChange={(e) => {
+                    setEditIsCompilation(e.target.checked);
+                    setCompilationModified(true);
+                  }}
+                />
+              </div>
+              <div className="modal-actions">
+                <button type="submit">Stage Edits</button>
+                <button
+                  type="button"
+                  onClick={() => setShowEditModal(false)}
+                >
+                  Cancel
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

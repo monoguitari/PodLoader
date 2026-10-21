@@ -721,18 +721,42 @@ fn build_m4a_alac_fixture(
     // mvhd atom (version 0: 4 bytes version/flags + 8 bytes times + 4 bytes timescale + 4 bytes duration)
     let timescale = 44_100u32;
     let duration = timescale * duration_seconds;
-    m4a.extend_from_slice(&36u32.to_be_bytes());
-    m4a.extend_from_slice(b"mvhd");
-    m4a.extend_from_slice(&[0u8; 12]); // version 0 + flags + creation/mod time
-    m4a.extend_from_slice(&timescale.to_be_bytes());
-    m4a.extend_from_slice(&duration.to_be_bytes());
-    m4a.extend_from_slice(&[0u8; 8]);
+    let mut moov_payload = Vec::new();
+    moov_payload.extend_from_slice(&36u32.to_be_bytes());
+    moov_payload.extend_from_slice(b"mvhd");
+    moov_payload.extend_from_slice(&[0u8; 12]); // version 0 + flags + creation/mod time
+    moov_payload.extend_from_slice(&timescale.to_be_bytes());
+    moov_payload.extend_from_slice(&duration.to_be_bytes());
+    moov_payload.extend_from_slice(&[0u8; 8]);
 
-    // ilst atoms
-    m4a.extend_from_slice(&encode_ilst_text_atom(b"\xA9nam", title));
-    m4a.extend_from_slice(&encode_ilst_text_atom(b"\xA9ART", artist));
-    m4a.extend_from_slice(&encode_ilst_text_atom(b"\xA9alb", album));
-    m4a.extend_from_slice(&encode_trkn_atom(track_number));
+    // ilst atoms inside udta -> meta
+    let mut ilst_payload = Vec::new();
+    ilst_payload.extend_from_slice(&encode_ilst_text_atom(b"\xA9nam", title));
+    ilst_payload.extend_from_slice(&encode_ilst_text_atom(b"\xA9ART", artist));
+    ilst_payload.extend_from_slice(&encode_ilst_text_atom(b"\xA9alb", album));
+    ilst_payload.extend_from_slice(&encode_trkn_atom(track_number));
+
+    let mut meta_payload = vec![0u8; 4]; // version/flags
+    let ilst_len = (8 + ilst_payload.len()) as u32;
+    meta_payload.extend_from_slice(&ilst_len.to_be_bytes());
+    meta_payload.extend_from_slice(b"ilst");
+    meta_payload.extend_from_slice(&ilst_payload);
+
+    let meta_len = (8 + meta_payload.len()) as u32;
+    let mut udta_payload = Vec::new();
+    udta_payload.extend_from_slice(&meta_len.to_be_bytes());
+    udta_payload.extend_from_slice(b"meta");
+    udta_payload.extend_from_slice(&meta_payload);
+
+    let udta_len = (8 + udta_payload.len()) as u32;
+    moov_payload.extend_from_slice(&udta_len.to_be_bytes());
+    moov_payload.extend_from_slice(b"udta");
+    moov_payload.extend_from_slice(&udta_payload);
+
+    let moov_len = (8 + moov_payload.len()) as u32;
+    m4a.extend_from_slice(&moov_len.to_be_bytes());
+    m4a.extend_from_slice(b"moov");
+    m4a.extend_from_slice(&moov_payload);
     m4a
 }
 
@@ -2413,6 +2437,370 @@ fn configures_per_device_transcode_presets_enforces_ffmpeg_availability_and_emit
     assert_eq!(last_event.total_tracks, 2);
     assert_eq!(last_event.track_percent, 100);
     assert_eq!(last_event.overall_percent, 100);
+}
+
+#[test]
+fn stages_and_commits_device_track_metadata_edits_updating_itunesdb_and_audio_tags() {
+    let device_temp = TempDir::new().expect("create device temp dir");
+    let mount_path = device_temp.path().to_path_buf();
+
+    let adapter = FakeHardwareAdapter {
+        volumes: vec![MountedVolume {
+            mount_path: mount_path.clone(),
+            volume_name: "IPOD".to_string(),
+            total_bytes: 30_000_000_000,
+            free_bytes: 29_950_000_000,
+            usb_firewire_guid: None,
+        }],
+    };
+    let mut engine = PodLoaderEngine::new(adapter);
+    engine
+        .initialize_device(&mount_path, "Edit iPod")
+        .expect("init device");
+
+    let host_temp = TempDir::new().expect("create host temp dir");
+    let mp3_path = host_temp.path().join("01 - Airbag.mp3");
+    fs::write(
+        &mp3_path,
+        build_id3v23_mp3_fixture(
+            "Airbag",
+            "Radiohead",
+            "OK Computer",
+            1,
+            "Alternative",
+            1997,
+            4,
+        ),
+    )
+    .expect("write mp3");
+
+    let m4a_path = host_temp.path().join("02 - Paranoid Android.m4a");
+    fs::write(
+        &m4a_path,
+        build_m4a_alac_fixture("Paranoid Android", "Radiohead", "OK Computer", 2, 4),
+    )
+    .expect("write m4a");
+
+    // Stage and commit initial tracks
+    engine
+        .stage_host_paths(&[mp3_path, m4a_path], None)
+        .expect("stage tracks");
+    let outcome = engine.commit_sync_batch().expect("commit initial tracks");
+    let session = match outcome {
+        CommitOutcome::Completed(s) => s,
+        other => panic!("expected Completed, got {:?}", other),
+    };
+    assert_eq!(session.library.tracks.len(), 2);
+    let track1_id = session.library.tracks[0].id;
+    let track2_id = session.library.tracks[1].id;
+    let track1_rel = session.library.tracks[0]
+        .obfuscated_path
+        .trim_start_matches(':')
+        .replace(':', "/");
+    let track1_disk_path = mount_path.join(track1_rel);
+    let track2_rel = session.library.tracks[1]
+        .obfuscated_path
+        .trim_start_matches(':')
+        .replace(':', "/");
+    let track2_disk_path = mount_path.join(track2_rel);
+
+    // 1. Stage single-track edit on Track 1
+    let single_edit = podloader_core::TrackMetadataEdits {
+        title: Some("Airbag (Remastered)".to_string()),
+        artist: Some("Radiohead".to_string()),
+        album: Some("OK Computer (Collector Edition)".to_string()),
+        album_artist: Some("Radiohead".to_string()),
+        track_number: Some(1),
+        disc_number: Some(1),
+        genre: Some("Art Rock".to_string()),
+        year: Some(2009),
+        is_compilation: Some(true),
+        rating: Some(5),
+    };
+    let batch = engine
+        .stage_track_metadata_edits(&[track1_id], single_edit)
+        .expect("stage track 1 edits");
+    assert_eq!(batch.edits.len(), 1);
+    assert_eq!(batch.edits[0].track_id, track1_id);
+    assert_eq!(
+        batch.edits[0].edits.title.as_deref(),
+        Some("Airbag (Remastered)")
+    );
+
+    // 2. Stage batch edit across Track 1 and Track 2 (updating shared genre and album_artist)
+    let batch_edit = podloader_core::TrackMetadataEdits {
+        genre: Some("Progressive Rock".to_string()),
+        album_artist: Some("Radiohead Band".to_string()),
+        ..Default::default()
+    };
+    let batch = engine
+        .stage_track_metadata_edits(&[track1_id, track2_id], batch_edit)
+        .expect("stage batch edits");
+    assert_eq!(batch.edits.len(), 2);
+
+    // 3. Commit the metadata edits
+    let commit_outcome = engine.commit_sync_batch().expect("commit metadata edits");
+    let updated_session = match commit_outcome {
+        CommitOutcome::Completed(s) => s,
+        other => panic!("expected Completed, got {:?}", other),
+    };
+
+    let updated_t1 = updated_session
+        .library
+        .tracks
+        .iter()
+        .find(|t| t.id == track1_id)
+        .expect("find track 1");
+    assert_eq!(updated_t1.title, "Airbag (Remastered)");
+    assert_eq!(updated_t1.album, "OK Computer (Collector Edition)");
+    assert_eq!(updated_t1.genre, "Progressive Rock");
+    assert_eq!(updated_t1.album_artist.as_deref(), Some("Radiohead Band"));
+    assert_eq!(updated_t1.year, 2009);
+    assert_eq!(updated_t1.rating, 5);
+    assert!(updated_t1.is_compilation);
+
+    let updated_t2 = updated_session
+        .library
+        .tracks
+        .iter()
+        .find(|t| t.id == track2_id)
+        .expect("find track 2");
+    assert_eq!(updated_t2.title, "Paranoid Android");
+    assert_eq!(updated_t2.genre, "Progressive Rock");
+    assert_eq!(updated_t2.album_artist.as_deref(), Some("Radiohead Band"));
+
+    // 4. Verify binary iTunesDB has updated mhit and mhod fields
+    let itunesdb_bytes = fs::read(mount_path.join("iPod_Control/iTunes/iTunesDB")).expect("read iTunesDB");
+    // Rating 5 -> raw byte 100 at mhit offset 30
+    assert!(
+        itunesdb_bytes.windows(2).any(|w| w == [100, 1]),
+        "expected rating 100 and compilation flag 1 in mhit header bytes"
+    );
+
+    // 5. Verify on-disk audio files had their embedded tags updated
+    let inspected_mp3 = engine
+        .browse_host_directory(track1_disk_path.parent().unwrap())
+        .expect("browse folder");
+    let disk_mp3 = inspected_mp3
+        .files
+        .iter()
+        .find(|f| f.path == track1_disk_path)
+        .expect("find mp3 on disk");
+    assert_eq!(disk_mp3.title, "Airbag (Remastered)");
+    assert_eq!(disk_mp3.album, "OK Computer (Collector Edition)");
+    assert_eq!(disk_mp3.genre, "Progressive Rock");
+    assert_eq!(disk_mp3.year, 2009);
+
+    let inspected_m4a = engine
+        .browse_host_directory(track2_disk_path.parent().unwrap())
+        .expect("browse m4a folder");
+    let disk_m4a = inspected_m4a
+        .files
+        .iter()
+        .find(|f| f.path == track2_disk_path)
+        .expect("find m4a on disk");
+    assert_eq!(disk_m4a.genre, "Progressive Rock");
+}
+
+#[test]
+fn stages_and_commits_track_removals_cleaning_up_playlists_and_deleting_audio_files() {
+    let device_temp = TempDir::new().expect("create device temp dir");
+    let mount_path = device_temp.path().to_path_buf();
+
+    let adapter = FakeHardwareAdapter {
+        volumes: vec![MountedVolume {
+            mount_path: mount_path.clone(),
+            volume_name: "IPOD".to_string(),
+            total_bytes: 30_000_000_000,
+            free_bytes: 29_950_000_000,
+            usb_firewire_guid: None,
+        }],
+    };
+    let mut engine = PodLoaderEngine::new(adapter);
+    engine
+        .initialize_device(&mount_path, "Removal iPod")
+        .expect("init device");
+
+    let host_temp = TempDir::new().expect("create host temp dir");
+    let track_a_path = host_temp.path().join("01 - Track A.mp3");
+    let track_b_path = host_temp.path().join("02 - Track B.mp3");
+    let track_c_path = host_temp.path().join("03 - Track C.mp3");
+
+    fs::write(
+        &track_a_path,
+        build_id3v23_mp3_fixture("Track A", "Artist A", "Album", 1, "Rock", 2020, 3),
+    )
+    .expect("write a");
+    fs::write(
+        &track_b_path,
+        build_id3v23_mp3_fixture("Track B", "Artist B", "Album", 2, "Rock", 2020, 3),
+    )
+    .expect("write b");
+    fs::write(
+        &track_c_path,
+        build_id3v23_mp3_fixture("Track C", "Artist C", "Album", 3, "Rock", 2020, 3),
+    )
+    .expect("write c");
+
+    // Stage and commit 3 tracks
+    engine
+        .stage_host_paths(&[track_a_path, track_b_path, track_c_path], None)
+        .expect("stage tracks");
+    let outcome = engine.commit_sync_batch().expect("commit tracks");
+    let session = match outcome {
+        CommitOutcome::Completed(s) => s,
+        other => panic!("expected Completed, got {:?}", other),
+    };
+    assert_eq!(session.library.tracks.len(), 3);
+    let track_b_id = session.library.tracks[1].id;
+    let track_b_rel = session.library.tracks[1]
+        .obfuscated_path
+        .trim_start_matches(':')
+        .replace(':', "/");
+    let track_b_disk = mount_path.join(track_b_rel);
+    assert!(track_b_disk.is_file(), "expected track B file to exist on disk before removal");
+
+    // 1. Stage removal of Track B
+    let batch = engine
+        .stage_track_removals(&[track_b_id])
+        .expect("stage removal of track b");
+    assert_eq!(batch.removals.len(), 1);
+    assert_eq!(batch.removals[0].track_id, track_b_id);
+    assert_eq!(batch.removals[0].track_title, "Track B");
+
+    // 2. Commit the removal
+    let outcome = engine.commit_sync_batch().expect("commit removal");
+    let updated_session = match outcome {
+        CommitOutcome::Completed(s) => s,
+        other => panic!("expected Completed, got {:?}", other),
+    };
+
+    // 3. Verify Track B is completely gone from Device Library tracks and Master Playlist
+    assert_eq!(updated_session.library.tracks.len(), 2);
+    assert!(
+        !updated_session.library.tracks.iter().any(|t| t.id == track_b_id),
+        "expected Track B to be removed from Device Library tracks"
+    );
+    let master_pl = updated_session
+        .library
+        .playlists
+        .iter()
+        .find(|p| p.kind == PlaylistKind::Master)
+        .expect("find master playlist");
+    assert_eq!(master_pl.track_ids.len(), 2);
+    assert!(
+        !master_pl.track_ids.contains(&track_b_id),
+        "expected Track B to be removed from Master Playlist"
+    );
+
+    // 4. Verify Track B file was deleted from disk
+    assert!(
+        !track_b_disk.exists(),
+        "expected Track B file {:?} to be deleted from disk",
+        track_b_disk
+    );
+}
+
+#[test]
+fn manages_device_playlists_create_rename_delete_add_remove_and_reorder() {
+    let device_temp = TempDir::new().expect("create device temp dir");
+    let mount_path = device_temp.path().to_path_buf();
+
+    let adapter = FakeHardwareAdapter {
+        volumes: vec![MountedVolume {
+            mount_path: mount_path.clone(),
+            volume_name: "IPOD".to_string(),
+            total_bytes: 30_000_000_000,
+            free_bytes: 29_950_000_000,
+            usb_firewire_guid: None,
+        }],
+    };
+    let mut engine = PodLoaderEngine::new(adapter);
+    engine
+        .initialize_device(&mount_path, "Playlist iPod")
+        .expect("init device");
+
+    let host_temp = TempDir::new().expect("create host temp dir");
+    let t1 = host_temp.path().join("01 - Song 1.mp3");
+    let t2 = host_temp.path().join("02 - Song 2.mp3");
+    let t3 = host_temp.path().join("03 - Song 3.mp3");
+    fs::write(&t1, build_id3v23_mp3_fixture("Song 1", "Artist", "Album", 1, "Pop", 2021, 3)).unwrap();
+    fs::write(&t2, build_id3v23_mp3_fixture("Song 2", "Artist", "Album", 2, "Pop", 2021, 3)).unwrap();
+    fs::write(&t3, build_id3v23_mp3_fixture("Song 3", "Artist", "Album", 3, "Pop", 2021, 3)).unwrap();
+
+    engine.stage_host_paths(&[t1, t2, t3], None).unwrap();
+    let outcome = engine.commit_sync_batch().unwrap();
+    let session = match outcome {
+        CommitOutcome::Completed(s) => s,
+        other => panic!("expected Completed, got {:?}", other),
+    };
+    let id1 = session.library.tracks[0].id;
+    let id2 = session.library.tracks[1].id;
+    let id3 = session.library.tracks[2].id;
+
+    // 1. Create a new user Device Playlist
+    let created_pl = engine
+        .create_device_playlist("Road Trip")
+        .expect("create playlist");
+    assert_eq!(created_pl.name, "Road Trip");
+    assert_eq!(created_pl.kind, PlaylistKind::User);
+    assert!(created_pl.track_ids.is_empty());
+    let pl_id = created_pl.id;
+
+    // 2. Add tracks [id1, id2, id3] to the playlist
+    let updated_pl = engine
+        .add_tracks_to_playlist(pl_id, &[id1, id2, id3])
+        .expect("add tracks to playlist");
+    assert_eq!(updated_pl.track_ids, vec![id1, id2, id3]);
+
+    // 3. Reorder tracks to [id3, id1, id2]
+    let reordered_pl = engine
+        .reorder_playlist_tracks(pl_id, &[id3, id1, id2])
+        .expect("reorder playlist");
+    assert_eq!(reordered_pl.track_ids, vec![id3, id1, id2]);
+
+    // 4. Remove track id1 from playlist -> [id3, id2]
+    let filtered_pl = engine
+        .remove_tracks_from_playlist(pl_id, &[id1])
+        .expect("remove track from playlist");
+    assert_eq!(filtered_pl.track_ids, vec![id3, id2]);
+
+    // 5. Rename playlist to "Summer Road Trip"
+    let renamed_pl = engine
+        .rename_device_playlist(pl_id, "Summer Road Trip")
+        .expect("rename playlist");
+    assert_eq!(renamed_pl.name, "Summer Road Trip");
+
+    // Verify iTunesDB contains the playlist on reload
+    let state = engine.scan_device().expect("scan device");
+    let current_session = match state {
+        DeviceConnectionState::Connected(s) => s,
+        other => panic!("expected Connected, got {:?}", other),
+    };
+    let found_pl = current_session
+        .library
+        .playlists
+        .iter()
+        .find(|p| p.id == pl_id)
+        .expect("find user playlist in library");
+    assert_eq!(found_pl.name, "Summer Road Trip");
+    assert_eq!(found_pl.track_ids, vec![id3, id2]);
+
+    // 6. Delete the playlist
+    engine
+        .delete_device_playlist(pl_id)
+        .expect("delete playlist");
+    let post_delete_state = engine.scan_device().expect("scan device");
+    let post_delete_session = match post_delete_state {
+        DeviceConnectionState::Connected(s) => s,
+        other => panic!("expected Connected, got {:?}", other),
+    };
+    assert!(
+        !post_delete_session.library.playlists.iter().any(|p| p.id == pl_id),
+        "expected user playlist to be deleted"
+    );
+    // Tracks themselves must remain untouched in library
+    assert_eq!(post_delete_session.library.tracks.len(), 3);
 }
 
 
