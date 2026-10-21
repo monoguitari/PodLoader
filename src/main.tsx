@@ -129,7 +129,7 @@ const defaultBridge: PodLoaderBridge = {
         options ?? {},
       );
     }
-    const res = await fetch("http://127.0.0.1:41731/api/commit_sync_batch", {
+    const res = await fetch("/api/commit_sync_batch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(options ?? {}),

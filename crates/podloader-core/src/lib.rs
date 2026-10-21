@@ -8,6 +8,7 @@ pub mod signing;
 pub mod sysinfo;
 pub mod tagging;
 pub mod transcode;
+pub mod fixtures;
 
 pub use crate::audio::{
     ActivePlaybackTrack, AudioSinkAdapter, AudioSourceKind, HeadlessAudioSinkAdapter,

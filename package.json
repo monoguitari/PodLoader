@@ -9,7 +9,8 @@
     "inspect": "PATH=\"$HOME/.cache/cargo/bin:$PATH\" CARGO_HOME=\"${CARGO_HOME:-$HOME/.cache/cargo}\" RUSTUP_HOME=\"${RUSTUP_HOME:-$HOME/.cache/rustup}\" cargo run --offline -p podloader-shell --",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "regtest": "node ./scripts/run-regtests.cjs"
   },
   "dependencies": {
     "react": "^19.0.0",
@@ -23,6 +24,7 @@
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.4",
     "jsdom": "^26.0.0",
+    "playwright": "^1.64.1",
     "typescript": "^5.7.3",
     "vite": "^6.1.0",
     "vitest": "^3.0.5"

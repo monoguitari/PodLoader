@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>PodLoader Feature Regression Suite Report</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 2rem; }
+    h1 { color: #38bdf8; border-bottom: 2px solid #1e293b; padding-bottom: 0.5rem; }
+    .badge { background: #059669; color: #fff; padding: 0.25rem 0.5rem; border-radius: 4px; font-size: 0.85rem; font-weight: bold; }
+    .video-section { margin: 2rem 0; background: #1e293b; padding: 1.5rem; border-radius: 8px; }
+    video { width: 100%; max-width: 960px; border-radius: 6px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 1.5rem; margin-top: 1.5rem; }
+    .card { background: #1e293b; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+    .card h3 { margin: 1rem; color: #94a3b8; font-size: 1rem; }
+    .card img { width: 100%; display: block; border-top: 1px solid #334155; }
+  </style>
+</head>
+<body>
+  <h1>PodLoader Feature Regression Test Suite <span class="badge">ALL PASSED</span></h1>
+  <p>Automated end-to-end regression test suite verifying User Stories and Acceptance Criteria across Tickets #2 through #7.</p>
+
+  <div class="video-section">
+    <h2>🎥 Full Session Video Recording</h2>
+    <video controls src="./videos/regtest_full_suite.webm"></video>
+  </div>
+
+  <h2>📸 Milestone Screenshots</h2>
+  <div class="grid">
+    
+      <div class="card">
+        <h3>01 ticket2 device library viewer</h3>
+        <img src="./screenshots/01_ticket2_device_library_viewer.png" alt="01_ticket2_device_library_viewer.png">
+      </div>
+      <div class="card">
+        <h3>02 ticket7 host audio playback</h3>
+        <img src="./screenshots/02_ticket7_host_audio_playback.png" alt="02_ticket7_host_audio_playback.png">
+      </div>
+      <div class="card">
+        <h3>03 ticket3 staged sync batch</h3>
+        <img src="./screenshots/03_ticket3_staged_sync_batch.png" alt="03_ticket3_staged_sync_batch.png">
+      </div>
+      <div class="card">
+        <h3>04 ticket4 alac transcoding staged</h3>
+        <img src="./screenshots/04_ticket4_alac_transcoding_staged.png" alt="04_ticket4_alac_transcoding_staged.png">
+      </div>
+      <div class="card">
+        <h3>05 ticket5 metadata and playlists</h3>
+        <img src="./screenshots/05_ticket5_metadata_and_playlists.png" alt="05_ticket5_metadata_and_playlists.png">
+      </div>
+      <div class="card">
+        <h3>06 ticket6 orphan recovery and export</h3>
+        <img src="./screenshots/06_ticket6_orphan_recovery_and_export.png" alt="06_ticket6_orphan_recovery_and_export.png">
+      </div>
+      <div class="card">
+        <h3>07 ticket6 and 7 safe ejected</h3>
+        <img src="./screenshots/07_ticket6_and_7_safe_ejected.png" alt="07_ticket6_and_7_safe_ejected.png">
+      </div>
+  </div>
+</body>
+</html>

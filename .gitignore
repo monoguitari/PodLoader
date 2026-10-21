@@ -3,3 +3,6 @@
 /dist
 /music
 .DS_Store
+/.regtest-env
+/regtest-artifacts/videos/*.webm
+/regtest-artifacts/exported_music/

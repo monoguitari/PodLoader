@@ -19,6 +19,41 @@ fn main() {
 
     let state = AppState::default();
 
+    if let Some(pos) = args.iter().position(|a| a == "--setup-regtest") {
+        if let Some(base_dir_str) = args.get(pos + 1) {
+            let base_dir = std::path::PathBuf::from(base_dir_str);
+            let device_dir = base_dir.join("device");
+            let host_dir = base_dir.join("host_music");
+            std::fs::create_dir_all(&device_dir).expect("create device dir");
+            std::fs::create_dir_all(&host_dir).expect("create host dir");
+
+            std::env::set_var("PODLOADER_DEVICE_MOUNT", &device_dir);
+
+            state
+                .initialize_device(&device_dir.to_string_lossy(), "RegTest Classic")
+                .expect("init regtest device");
+
+            podloader_core::fixtures::generate_regtest_sample_audio(&host_dir)
+                .expect("generate regtest sample audio");
+
+            let f14_dir = device_dir.join("iPod_Control").join("Music").join("F14");
+            std::fs::create_dir_all(&f14_dir).expect("create F14 dir");
+            let orphan_bytes = podloader_core::fixtures::build_id3v23_mp3_fixture(
+                "Lost Mariner",
+                "Ghost Crew",
+                "Sunken Echoes",
+                9,
+                "Sea Folk",
+                2021,
+                3,
+            );
+            std::fs::write(f14_dir.join("LOST.mp3"), orphan_bytes).expect("write orphan file");
+
+            println!("Regtest environment ready at {:?}", base_dir);
+            return;
+        }
+    }
+
     if args.iter().any(|a| a == "--serve") {
         run_dev_bridge_server(&state);
         return;
@@ -173,6 +208,13 @@ fn handle_http_client(mut stream: std::net::TcpStream, state: &AppState) -> std:
     if first_line.is_empty() {
         return Ok(());
     }
+
+    if first_line.starts_with("OPTIONS ") {
+        let resp = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nConnection: close\r\n\r\n";
+        stream.write_all(resp.as_bytes())?;
+        return Ok(());
+    }
+
     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
 
     let response_json = if first_line.starts_with("GET /api/scan_device") {
