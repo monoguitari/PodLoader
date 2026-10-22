@@ -1714,7 +1714,7 @@ impl<A: HardwareDeviceAdapter, S: AudioSinkAdapter> PodLoaderEngine<A, S> {
 
     pub fn play_host_file(&self, host_file: &HostFile) -> Result<PlaybackStatus, PodLoaderError> {
         let mut sink = self.audio_sink.borrow_mut();
-        let dur = sink.play_source(&host_file.path, 0)?;
+        let dur = sink.play_source_with_duration(&host_file.path, 0, Some(host_file.duration_ms))?;
         let active = ActivePlaybackTrack {
             source_kind: AudioSourceKind::Host,
             source_path: host_file.path.clone(),
@@ -1840,7 +1840,7 @@ impl<A: HardwareDeviceAdapter, S: AudioSinkAdapter> PodLoaderEngine<A, S> {
             )));
         }
         let mut sink = self.audio_sink.borrow_mut();
-        let dur = sink.play_source(&disk_path, 0)?;
+        let dur = sink.play_source_with_duration(&disk_path, 0, Some(track.duration_ms))?;
         let active = ActivePlaybackTrack {
             source_kind: AudioSourceKind::Device,
             source_path: disk_path,

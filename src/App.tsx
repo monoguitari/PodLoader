@@ -494,6 +494,15 @@ export function App({ bridge }: AppProps) {
     if (!bridge.playHostFile) return;
     setLoadingHostPath(hostFile.path);
     setIsAudioBuffering(true);
+
+    // Concurrently trigger audio stream decoding in parallel with IPC metadata setup
+    if (audioRef.current) {
+      const srcUrl = `/api/audio_stream?path=${encodeURIComponent(hostFile.path)}&t=${Date.now()}`;
+      logger.audio(`Set audio.src to ${srcUrl} (parallel stream initiated)`);
+      audioRef.current.src = srcUrl;
+      safePlayAudio(audioRef.current);
+    }
+
     try {
       const status = await bridge.playHostFile(hostFile);
       const ipcMs = Math.round(performance.now() - startTime);
@@ -505,11 +514,7 @@ export function App({ bridge }: AppProps) {
       setPlaybackStatus(status);
       setErrorMessage(null);
       if (audioRef.current) {
-        const srcUrl = `/api/audio_stream?path=${encodeURIComponent(hostFile.path)}&t=${Date.now()}`;
-        logger.audio(`Set audio.src to ${srcUrl}`);
-        audioRef.current.src = srcUrl;
         audioRef.current.volume = status.volume;
-        safePlayAudio(audioRef.current);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -528,6 +533,15 @@ export function App({ bridge }: AppProps) {
     if (!bridge.playDeviceTrack) return;
     setLoadingTrackId(trackId);
     setIsAudioBuffering(true);
+
+    // Concurrently trigger audio stream decoding in parallel with IPC metadata setup
+    if (audioRef.current) {
+      const srcUrl = `/api/audio_stream?trackId=${trackId}&t=${Date.now()}`;
+      logger.audio(`Set audio.src to ${srcUrl} (parallel stream initiated)`);
+      audioRef.current.src = srcUrl;
+      safePlayAudio(audioRef.current);
+    }
+
     try {
       const status = await bridge.playDeviceTrack(trackId);
       const ipcMs = Math.round(performance.now() - startTime);
@@ -539,11 +553,7 @@ export function App({ bridge }: AppProps) {
       setPlaybackStatus(status);
       setErrorMessage(null);
       if (audioRef.current) {
-        const srcUrl = `/api/audio_stream?trackId=${trackId}&t=${Date.now()}`;
-        logger.audio(`Set audio.src to ${srcUrl}`);
-        audioRef.current.src = srcUrl;
         audioRef.current.volume = status.volume;
-        safePlayAudio(audioRef.current);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

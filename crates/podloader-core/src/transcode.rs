@@ -684,6 +684,44 @@ pub fn is_alac_file(path: &Path) -> bool {
     if ext != "m4a" && ext != "mp4" && ext != "alac" {
         return false;
     }
+    // Fast path: inspect MP4 atoms via seek to avoid opening full symphonia container
+    if let Ok(mut file) = std::fs::File::open(path) {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut hdr = [0u8; 8];
+        while let Ok(()) = file.read_exact(&mut hdr) {
+            let size = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as u64;
+            let fourcc = &hdr[4..8];
+            if fourcc == b"moov" {
+                let moov_size = if size > 8 { size - 8 } else { 0 };
+                let read_size = moov_size.min(1024 * 1024) as usize;
+                let mut moov_buf = vec![0u8; read_size];
+                if file.read_exact(&mut moov_buf).is_ok() {
+                    return moov_buf.windows(4).any(|w| w == b"alac");
+                }
+                break;
+            } else if size == 1 {
+                let mut extended_size = [0u8; 8];
+                if file.read_exact(&mut extended_size).is_ok() {
+                    let full_size = u64::from_be_bytes(extended_size);
+                    if full_size >= 16 {
+                        if file.seek(SeekFrom::Current((full_size - 16) as i64)).is_err() {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            } else if size > 8 {
+                if file.seek(SeekFrom::Current((size - 8) as i64)).is_err() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+    }
     if let Ok(format) = open_symphonia_format(path) {
         if let Some(track) = format.default_track(TrackType::Audio) {
             if let Some(audio) = track.codec_params.as_ref().and_then(|p| p.audio()) {

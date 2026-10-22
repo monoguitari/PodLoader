@@ -41,7 +41,15 @@ pub struct PlaybackStatus {
 }
 
 pub trait AudioSinkAdapter: Send + Sync {
-    fn play_source(&mut self, source_path: &Path, start_position_ms: u32) -> Result<u32, PodLoaderError>;
+    fn play_source(&mut self, source_path: &Path, start_position_ms: u32) -> Result<u32, PodLoaderError> {
+        self.play_source_with_duration(source_path, start_position_ms, None)
+    }
+    fn play_source_with_duration(
+        &mut self,
+        source_path: &Path,
+        start_position_ms: u32,
+        known_duration_ms: Option<u32>,
+    ) -> Result<u32, PodLoaderError>;
     fn pause(&mut self) -> Result<(), PodLoaderError>;
     fn resume(&mut self) -> Result<(), PodLoaderError>;
     fn stop(&mut self) -> Result<(), PodLoaderError>;
@@ -75,8 +83,15 @@ impl Default for HeadlessAudioSinkAdapter {
 }
 
 impl AudioSinkAdapter for HeadlessAudioSinkAdapter {
-    fn play_source(&mut self, source_path: &Path, start_position_ms: u32) -> Result<u32, PodLoaderError> {
-        let dur = if let Ok(hf) = crate::host::inspect_host_file(source_path) {
+    fn play_source_with_duration(
+        &mut self,
+        source_path: &Path,
+        start_position_ms: u32,
+        known_duration_ms: Option<u32>,
+    ) -> Result<u32, PodLoaderError> {
+        let dur = if let Some(d) = known_duration_ms.filter(|&d| d > 0) {
+            d
+        } else if let Ok(hf) = crate::host::inspect_host_file(source_path) {
             hf.duration_ms.max(1000)
         } else {
             180_000
