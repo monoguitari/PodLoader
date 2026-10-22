@@ -2,7 +2,7 @@ export interface LogEntry {
   id: number;
   timestamp: string;
   level: "info" | "warn" | "error" | "debug";
-  category: "AUDIO" | "IPC" | "UI" | "SYSTEM";
+  category: "AUDIO" | "IPC" | "UI" | "SYSTEM" | "PERF";
   message: string;
   details?: unknown;
 }
@@ -111,6 +111,10 @@ class DebugLogger {
 
   public system(message: string, details?: unknown) {
     this.log("info", "SYSTEM", message, details);
+  }
+
+  public perf(message: string, details?: unknown) {
+    this.log("info", "PERF", message, details);
   }
 
   public subscribe(listener: () => void): () => void {

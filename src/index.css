@@ -2033,6 +2033,18 @@ input[aria-label="Volume"] {
   background: rgba(255, 159, 10, 0.15);
   color: var(--apple-system-orange);
 }
+.debug-log-cat.cat-perf {
+  background: rgba(255, 214, 10, 0.15);
+  color: var(--apple-system-yellow);
+}
+
+.status-pill.latency-pill {
+  background: rgba(255, 214, 10, 0.12);
+  color: var(--apple-system-yellow);
+  border: 1px solid rgba(255, 214, 10, 0.3);
+  font-family: var(--font-mono);
+  font-weight: 600;
+}
 
 .debug-log-msg {
   word-break: break-word;

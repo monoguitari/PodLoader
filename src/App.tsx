@@ -280,6 +280,14 @@ export function App({ bridge }: AppProps) {
   const [isAutoScroll, setIsAutoScroll] = useState<boolean>(true);
   const [copiedLogs, setCopiedLogs] = useState<boolean>(false);
   const logsContainerRef = useRef<HTMLDivElement | null>(null);
+  const playInitiatedTimeRef = useRef<number | null>(null);
+  const playIpcResolvedTimeRef = useRef<number | null>(null);
+  const [lastPlaybackLatency, setLastPlaybackLatency] = useState<{
+    totalMs: number;
+    ipcMs: number;
+    audioMs: number;
+    trackTitle?: string;
+  } | null>(null);
 
   useEffect(() => {
     return logger.subscribe(() => {
@@ -479,13 +487,21 @@ export function App({ bridge }: AppProps) {
   };
 
   const handlePlayHostFile = async (hostFile: HostFile) => {
+    const startTime = performance.now();
+    playInitiatedTimeRef.current = startTime;
+    playIpcResolvedTimeRef.current = null;
     logger.ui(`Play Host File: ${hostFile.path}`);
     if (!bridge.playHostFile) return;
     setLoadingHostPath(hostFile.path);
     setIsAudioBuffering(true);
     try {
       const status = await bridge.playHostFile(hostFile);
-      logger.ipc("playHostFile response", status);
+      const ipcMs = Math.round(performance.now() - startTime);
+      playIpcResolvedTimeRef.current = performance.now();
+      logger.ipc(
+        `playHostFile response (IPC latency: ${ipcMs}ms / ${(ipcMs / 1000).toFixed(2)}s)`,
+        status,
+      );
       setPlaybackStatus(status);
       setErrorMessage(null);
       if (audioRef.current) {
@@ -505,13 +521,21 @@ export function App({ bridge }: AppProps) {
   };
 
   const handlePlayDeviceTrack = async (trackId: number) => {
+    const startTime = performance.now();
+    playInitiatedTimeRef.current = startTime;
+    playIpcResolvedTimeRef.current = null;
     logger.ui(`Play Device Track: id=${trackId}`);
     if (!bridge.playDeviceTrack) return;
     setLoadingTrackId(trackId);
     setIsAudioBuffering(true);
     try {
       const status = await bridge.playDeviceTrack(trackId);
-      logger.ipc("playDeviceTrack response", status);
+      const ipcMs = Math.round(performance.now() - startTime);
+      playIpcResolvedTimeRef.current = performance.now();
+      logger.ipc(
+        `playDeviceTrack response (IPC latency: ${ipcMs}ms / ${(ipcMs / 1000).toFixed(2)}s)`,
+        status,
+      );
       setPlaybackStatus(status);
       setErrorMessage(null);
       if (audioRef.current) {
@@ -789,6 +813,32 @@ export function App({ bridge }: AppProps) {
           }}
           onPlaying={() => {
             logger.audio("audio playing: hardware audio stream active");
+            if (playInitiatedTimeRef.current !== null) {
+              const totalMs = Math.round(
+                performance.now() - playInitiatedTimeRef.current,
+              );
+              const ipcMs =
+                playIpcResolvedTimeRef.current !== null
+                  ? Math.round(
+                      playIpcResolvedTimeRef.current -
+                        playInitiatedTimeRef.current,
+                    )
+                  : 0;
+              const audioMs = Math.max(0, totalMs - ipcMs);
+              const latencyStats = {
+                totalMs,
+                ipcMs,
+                audioMs,
+                trackTitle: playbackStatus.track?.title,
+              };
+              setLastPlaybackLatency(latencyStats);
+              logger.perf(
+                `Track playback started in ${totalMs}ms (${(totalMs / 1000).toFixed(2)}s) — IPC: ${ipcMs}ms, Audio buffering: ${audioMs}ms`,
+                latencyStats,
+              );
+              playInitiatedTimeRef.current = null;
+              playIpcResolvedTimeRef.current = null;
+            }
             setIsAudioBuffering(false);
             setLoadingTrackId(null);
             setLoadingHostPath(null);
@@ -837,6 +887,14 @@ export function App({ bridge }: AppProps) {
         />
       </div>
       <div className="player-dock-status">
+        {lastPlaybackLatency && (
+          <span
+            className="status-pill latency-pill"
+            title={`Last playback latency: ${lastPlaybackLatency.totalMs}ms (IPC: ${lastPlaybackLatency.ipcMs}ms, Audio buffering: ${lastPlaybackLatency.audioMs}ms)`}
+          >
+            ⚡ {(lastPlaybackLatency.totalMs / 1000).toFixed(2)}s latency
+          </span>
+        )}
         <button
           type="button"
           className={`status-pill debug-toggle-pill ${isDebugOpen ? "active" : ""}`}
@@ -910,6 +968,7 @@ export function App({ bridge }: AppProps) {
               aria-label="Filter category"
             >
               <option value="ALL">All Categories</option>
+              <option value="PERF">⚡ Performance / Latency</option>
               <option value="AUDIO">Audio Only</option>
               <option value="IPC">IPC / Bridge</option>
               <option value="UI">UI Actions</option>
