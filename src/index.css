@@ -1,0 +1,2215 @@
+/* =============================================================
+   PodLoader: Apple macOS & iTunes Design System
+   Inspired by Apple Human Interface Guidelines (HIG) & iTunes
+   ============================================================= */
+
+:root {
+  /* Apple macOS Dark Palette */
+  --apple-bg-base: #161618;
+  --apple-bg-window: #1e1e20;
+  --apple-bg-sidebar: #141416;
+  --apple-bg-content: #1b1b1d;
+  --apple-bg-row-alt: #222225;
+  --apple-bg-elevated: #28282b;
+  --apple-bg-input: #101012;
+  --apple-bg-hover: rgba(255, 255, 255, 0.06);
+  --apple-bg-active: rgba(255, 255, 255, 0.12);
+
+  /* Apple System Borders */
+  --apple-border-subtle: rgba(255, 255, 255, 0.08);
+  --apple-border-medium: rgba(255, 255, 255, 0.14);
+  --apple-border-strong: rgba(255, 255, 255, 0.22);
+  --apple-border-focus: #0a84ff;
+
+  /* Apple Typography Hierarchy */
+  --apple-text-primary: #ffffff;
+  --apple-text-secondary: rgba(235, 235, 245, 0.65);
+  --apple-text-tertiary: rgba(235, 235, 245, 0.35);
+  --apple-text-quaternary: rgba(235, 235, 245, 0.2);
+
+  /* Apple System Accent Colors */
+  --apple-system-blue: #0a84ff;
+  --apple-system-blue-hover: #0071e3;
+  --apple-system-blue-glow: rgba(10, 132, 255, 0.3);
+
+  --apple-system-green: #30d158;
+  --apple-system-green-glow: rgba(48, 209, 88, 0.25);
+
+  --apple-system-orange: #ff9f0a;
+  --apple-system-yellow: #ffd60a;
+  --apple-system-red: #ff453a;
+  --apple-system-red-hover: #d70015;
+  --apple-system-red-glow: rgba(255, 69, 58, 0.25);
+
+  --apple-system-purple: #bf5af2;
+  --apple-system-indigo: #5e5ce6;
+  --apple-music-pink: #fa2d48;
+
+  /* iTunes Capacity Bar Colors */
+  --itunes-audio-color: #0a84ff;
+  --itunes-video-color: #bf5af2;
+  --itunes-photos-color: #ffd60a;
+  --itunes-other-color: #ff9f0a;
+  --itunes-free-color: #3a3a3c;
+
+  /* Radii */
+  --radius-xs: 3px;
+  --radius-sm: 5px;
+  --radius-md: 7px;
+  --radius-lg: 10px;
+  --radius-xl: 14px;
+  --radius-full: 9999px;
+
+  /* Fonts */
+  --font-system: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-mono: -apple-system-monospaced, "SF Mono", Menlo, Monaco, Consolas, monospace;
+
+  /* Shadows */
+  --apple-shadow-window: 0 24px 60px rgba(0, 0, 0, 0.7), 0 0 1px rgba(255, 255, 255, 0.15);
+  --apple-shadow-popover: 0 12px 30px rgba(0, 0, 0, 0.5), 0 0 1px rgba(255, 255, 255, 0.2);
+  --apple-shadow-lcd: inset 0 2px 4px rgba(0, 0, 0, 0.8), 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+/* Base Reset */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  background-color: var(--apple-bg-base);
+  color: var(--apple-text-primary);
+  font-family: var(--font-system);
+  font-size: 13px;
+  line-height: 1.4;
+  letter-spacing: -0.01em;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Accessible, clean focus states without default blue rings */
+*:focus {
+  outline: none;
+}
+*:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--apple-border-focus);
+}
+
+/* Native macOS Scrollbars */
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18);
+  border-radius: var(--radius-full);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+/* Main Shell */
+.podloader-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+  background-color: var(--apple-bg-window);
+}
+
+/* =============================================================
+   macOS TRAFFIC LIGHTS (WINDOW CONTROLS)
+   ============================================================= */
+.macos-traffic-lights {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-right: 0.85rem;
+  user-select: none;
+}
+
+.traffic-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  position: relative;
+  transition: opacity 0.15s ease;
+}
+.traffic-dot.close {
+  background-color: #ff5f56;
+  border: 1px solid #e0443e;
+}
+.traffic-dot.minimize {
+  background-color: #ffbd2e;
+  border: 1px solid #dea123;
+}
+.traffic-dot.zoom {
+  background-color: #27c93f;
+  border: 1px solid #1aab29;
+}
+.macos-traffic-lights:hover .traffic-dot {
+  filter: brightness(1.05);
+}
+
+/* =============================================================
+   TOP BAR / macOS TITLEBAR & TOOLBAR
+   ============================================================= */
+.device-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.65rem 1rem;
+  background: linear-gradient(180deg, #2a2a2d 0%, #1f1f22 100%);
+  border-bottom: 1px solid rgba(0, 0, 0, 0.6);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.05);
+  user-select: none;
+  z-index: 20;
+  gap: 1.25rem;
+}
+
+.device-header .header-left-cluster,
+.device-header > div:first-child {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.75rem 1.25rem;
+}
+
+.device-title-row {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.device-title-row h1 {
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: var(--apple-text-primary);
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  letter-spacing: -0.015em;
+}
+
+.device-title-row h1::before {
+  content: "";
+  font-size: 1.2rem;
+  color: var(--apple-text-secondary);
+}
+
+.device-header p {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.78rem;
+  color: var(--apple-text-secondary);
+}
+
+.device-header p span {
+  display: inline-flex;
+  align-items: center;
+  background: rgba(255, 255, 255, 0.06);
+  padding: 0.15rem 0.5rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--apple-border-subtle);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--apple-text-primary);
+}
+
+/* Eject Button (Apple Hardware Style) */
+.device-title-row button {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.08) 0%, rgba(255, 255, 255, 0.02) 100%);
+  color: var(--apple-text-secondary);
+  border: 1px solid var(--apple-border-medium);
+  padding: 0.25rem 0.65rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  transition: all 0.15s ease;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+}
+.device-title-row button::before {
+  content: "⏏";
+  font-size: 0.85rem;
+}
+.device-title-row button:hover {
+  background: var(--apple-system-red);
+  color: #fff;
+  border-color: var(--apple-system-red);
+  box-shadow: 0 0 10px var(--apple-system-red-glow);
+}
+
+/* Controls Cluster in Header */
+.guid-controls,
+.transcode-preset-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  background: rgba(0, 0, 0, 0.3);
+  padding: 0.2rem 0.5rem;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--apple-border-subtle);
+}
+
+.guid-controls label,
+.transcode-preset-controls label {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--apple-text-tertiary);
+}
+
+.guid-controls input {
+  background: var(--apple-bg-input);
+  border: 1px solid var(--apple-border-subtle);
+  color: var(--apple-text-primary);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  padding: 0.2rem 0.45rem;
+  border-radius: var(--radius-xs);
+  width: 135px;
+}
+
+.guid-controls button {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.1) 0%, rgba(255, 255, 255, 0.03) 100%);
+  border: 1px solid var(--apple-border-medium);
+  color: var(--apple-text-primary);
+  padding: 0.2rem 0.55rem;
+  border-radius: var(--radius-xs);
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.guid-controls button:hover {
+  background: var(--apple-system-blue);
+  border-color: var(--apple-system-blue);
+  color: #fff;
+}
+
+.transcode-preset-controls select {
+  background: var(--apple-bg-input);
+  border: 1px solid var(--apple-border-subtle);
+  color: var(--apple-text-primary);
+  padding: 0.2rem 0.5rem;
+  border-radius: var(--radius-xs);
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+
+.ffmpeg-unavailable-hint {
+  font-size: 0.7rem;
+  color: var(--apple-system-orange);
+  margin-left: 0.25rem;
+}
+
+/* =============================================================
+   ICONIC iTUNES LCD SCREEN (CENTER OF TOP BAR)
+   ============================================================= */
+.itunes-lcd-screen {
+  flex: 1;
+  max-width: 360px;
+  min-width: 240px;
+  height: 48px;
+  background: linear-gradient(180deg, #18191d 0%, #0d0e11 100%);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--apple-shadow-lcd);
+  display: flex;
+  align-items: center;
+  padding: 0 0.85rem;
+  gap: 0.65rem;
+  user-select: none;
+}
+
+.lcd-apple-logo {
+  font-size: 1.15rem;
+  color: var(--apple-text-tertiary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.lcd-display-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  overflow: hidden;
+  text-align: center;
+}
+
+.lcd-track-title {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: #fff;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  letter-spacing: -0.01em;
+}
+
+.lcd-track-artist {
+  font-size: 0.7rem;
+  color: var(--apple-text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lcd-progress-track {
+  height: 3px;
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: var(--radius-full);
+  margin-top: 3px;
+  overflow: hidden;
+}
+
+.lcd-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--apple-system-blue), var(--apple-system-indigo));
+  border-radius: var(--radius-full);
+  transition: width 0.25s linear;
+}
+
+.lcd-idle-title {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--apple-text-secondary);
+}
+
+.lcd-idle-subtitle {
+  font-size: 0.7rem;
+  color: var(--apple-text-tertiary);
+}
+
+/* Top Storage Summary Pill */
+.storage-summary {
+  display: inline-flex;
+  align-items: center;
+  background: rgba(0, 0, 0, 0.35);
+  padding: 0.3rem 0.75rem;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--apple-border-subtle);
+  font-size: 0.75rem;
+  color: var(--apple-text-secondary);
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}
+.storage-summary span:first-child {
+  color: var(--apple-system-blue);
+  font-weight: 600;
+}
+
+/* =============================================================
+   ALERTS & BANNERS (macOS NOTIFICATION STYLE)
+   ============================================================= */
+.error-banner,
+.success-banner,
+.transfer-progress-banner,
+.interrupted-batch-prompt {
+  padding: 0.55rem 1.25rem;
+  font-size: 0.8rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  border-bottom: 1px solid transparent;
+  animation: slideDown 0.2s ease-out;
+}
+
+@keyframes slideDown {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.error-banner {
+  background: rgba(255, 69, 58, 0.15);
+  color: #ffb4ab;
+  border-color: rgba(255, 69, 58, 0.3);
+}
+.error-banner::before {
+  content: "⚠️";
+}
+
+.success-banner {
+  background: rgba(48, 209, 88, 0.15);
+  color: #a7f3d0;
+  border-color: rgba(48, 209, 88, 0.3);
+}
+.success-banner::before {
+  content: "✓";
+  font-weight: bold;
+}
+
+.transfer-progress-banner {
+  background: rgba(10, 132, 255, 0.15);
+  color: #bae6fd;
+  border-color: rgba(10, 132, 255, 0.3);
+  display: flex;
+  justify-content: space-between;
+}
+
+.interrupted-batch-prompt {
+  background: rgba(255, 159, 10, 0.15);
+  color: #ffde9e;
+  border-color: rgba(255, 159, 10, 0.3);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.interrupted-batch-prompt button {
+  background: var(--apple-bg-elevated);
+  border: 1px solid var(--apple-border-medium);
+  color: #fff;
+  padding: 0.25rem 0.65rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.75rem;
+  cursor: pointer;
+  margin-left: 0.4rem;
+}
+
+/* =============================================================
+   WORKSPACE DUAL PANE ARCHITECTURE
+   ============================================================= */
+.workspace {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--apple-bg-content);
+}
+
+/* =============================================================
+   macOS SOURCE LIST (LEFT SIDEBAR)
+   ============================================================= */
+.playlist-sidebar {
+  width: 240px;
+  min-width: 200px;
+  max-width: 300px;
+  background: var(--apple-bg-sidebar);
+  border-right: 1px solid var(--apple-border-subtle);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  user-select: none;
+  order: 1;
+}
+
+.playlist-sidebar section {
+  padding: 0.75rem 0.5rem 0.35rem 0.5rem;
+}
+
+.playlist-sidebar h2 {
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--apple-text-tertiary);
+  margin-bottom: 0.3rem;
+  padding: 0 0.5rem;
+}
+
+.playlist-sidebar ul {
+  list-style: none;
+}
+
+.playlist-sidebar li {
+  margin-bottom: 2px;
+}
+
+.playlist-item-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-radius: var(--radius-sm);
+  padding: 0.1rem 0.2rem;
+  transition: background 0.12s ease;
+}
+.playlist-item-row:hover {
+  background: var(--apple-bg-hover);
+}
+
+.playlist-item-row button[type="button"]:first-child {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--apple-text-primary);
+  font-size: 0.82rem;
+  font-weight: 450;
+  text-align: left;
+  padding: 0.35rem 0.55rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all 0.12s ease;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+/* Icons via CSS ::before matching playlist kind */
+.playlist-sidebar section:first-of-type .playlist-item-row button[type="button"]:first-child::before {
+  content: "";
+  font-size: 0.95rem;
+  color: var(--apple-text-secondary);
+}
+.playlist-sidebar section:nth-of-type(2) .playlist-item-row button[type="button"]:first-child::before {
+  content: "♫";
+  font-size: 0.9rem;
+  color: var(--apple-text-secondary);
+}
+.playlist-sidebar section:nth-of-type(3) .playlist-item-row button[type="button"]:first-child::before {
+  content: "⚙";
+  font-size: 0.85rem;
+  color: var(--apple-text-secondary);
+}
+
+/* Selected playlist pill (macOS Blue) */
+.playlist-item-row button[aria-pressed="true"] {
+  background: var(--apple-system-blue) !important;
+  color: #ffffff !important;
+  font-weight: 600 !important;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+}
+.playlist-item-row button[aria-pressed="true"]::before {
+  color: #ffffff !important;
+}
+
+.playlist-item-actions {
+  display: none;
+  align-items: center;
+  gap: 0.2rem;
+  padding-right: 0.3rem;
+}
+.playlist-item-row:hover .playlist-item-actions {
+  display: flex;
+}
+
+.playlist-item-actions button {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--apple-border-subtle);
+  color: var(--apple-text-secondary);
+  font-size: 0.65rem;
+  padding: 0.15rem 0.35rem;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+}
+.playlist-item-actions button:hover {
+  background: var(--apple-bg-active);
+  color: #fff;
+}
+
+/* Playlist Create Form */
+.playlist-create-bar button {
+  width: 100%;
+  background: transparent;
+  border: 1px dashed var(--apple-border-medium);
+  color: var(--apple-text-secondary);
+  padding: 0.3rem 0.5rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.75rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  margin-top: 0.3rem;
+}
+.playlist-create-bar button:hover {
+  border-color: var(--apple-system-blue);
+  color: var(--apple-system-blue);
+  background: rgba(10, 132, 255, 0.05);
+}
+
+.playlist-create-form,
+.playlist-rename-form {
+  display: flex;
+  gap: 0.3rem;
+  align-items: center;
+  padding: 0.25rem 0.4rem;
+}
+.playlist-create-form input,
+.playlist-rename-form input {
+  flex: 1;
+  background: var(--apple-bg-input);
+  border: 1px solid var(--apple-border-strong);
+  color: #fff;
+  font-size: 0.78rem;
+  padding: 0.2rem 0.45rem;
+  border-radius: var(--radius-xs);
+}
+.playlist-create-form button,
+.playlist-rename-form button {
+  background: var(--apple-bg-elevated);
+  border: 1px solid var(--apple-border-medium);
+  color: #fff;
+  font-size: 0.72rem;
+  padding: 0.2rem 0.45rem;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+}
+.playlist-create-form button:hover,
+.playlist-rename-form button:hover {
+  background: var(--apple-system-blue);
+  border-color: var(--apple-system-blue);
+}
+
+/* =============================================================
+   ICONIC iTUNES CAPACITY BAR (AT SIDEBAR BOTTOM)
+   ============================================================= */
+.sidebar-capacity-footer {
+  margin-top: auto;
+  padding: 0.85rem;
+  border-top: 1px solid var(--apple-border-subtle);
+  background: rgba(15, 15, 18, 0.85);
+  user-select: none;
+}
+
+.capacity-label-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.72rem;
+  color: var(--apple-text-secondary);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.capacity-pct {
+  color: var(--apple-system-blue);
+  font-family: var(--font-mono);
+}
+
+.capacity-gauge-track {
+  height: 8px;
+  background: var(--itunes-free-color);
+  border-radius: var(--radius-full);
+  overflow: hidden;
+  margin: 0.5rem 0;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.capacity-gauge-fill {
+  height: 100%;
+  background: linear-gradient(180deg, #3aa1ff 0%, #0071e3 100%);
+  border-radius: var(--radius-full);
+  transition: width 0.3s ease;
+  box-shadow: 0 0 6px rgba(10, 132, 255, 0.4);
+}
+
+.storage-summary-mini {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--apple-text-tertiary);
+  display: flex;
+  justify-content: space-between;
+}
+
+/* =============================================================
+   HOST FILE BROWSER PANE
+   ============================================================= */
+.host-browser-pane {
+  width: 360px;
+  min-width: 280px;
+  max-width: 440px;
+  background: #141416;
+  border-right: 1px solid var(--apple-border-subtle);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  order: 2;
+  transition: width 0.2s ease, opacity 0.2s ease;
+}
+.host-browser-pane.collapsed {
+  display: none;
+}
+
+.host-browser-pane h2 {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--apple-text-tertiary);
+  padding: 0.75rem 1rem 0.4rem 1rem;
+}
+
+.host-path-bar {
+  padding: 0 0.85rem 0.65rem 0.85rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  align-items: center;
+}
+
+.host-path-bar label {
+  display: none;
+}
+
+.host-path-bar input {
+  flex: 1;
+  min-width: 140px;
+  background: var(--apple-bg-input);
+  border: 1px solid var(--apple-border-strong);
+  color: #fff;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  padding: 0.3rem 0.55rem;
+  border-radius: var(--radius-sm);
+}
+
+.host-path-bar button {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.08) 0%, rgba(255, 255, 255, 0.02) 100%);
+  border: 1px solid var(--apple-border-medium);
+  color: #fff;
+  font-size: 0.75rem;
+  font-weight: 500;
+  padding: 0.3rem 0.6rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+.host-path-bar button:hover {
+  background: var(--apple-bg-active);
+  border-color: var(--apple-border-strong);
+}
+
+.host-subdirs {
+  list-style: none;
+  padding: 0 0.85rem 0.5rem 0.85rem;
+  max-height: 130px;
+  overflow-y: auto;
+  border-bottom: 1px solid var(--apple-border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.host-subdirs li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.15rem 0.35rem;
+  border-radius: var(--radius-xs);
+  transition: background 0.1s ease;
+}
+.host-subdirs li:hover {
+  background: var(--apple-bg-hover);
+}
+
+.host-subdirs li button:first-child {
+  background: transparent;
+  border: none;
+  color: var(--apple-text-secondary);
+  font-size: 0.78rem;
+  cursor: pointer;
+  text-align: left;
+  flex: 1;
+}
+.host-subdirs li button:first-child:hover {
+  color: #fff;
+}
+
+.host-subdirs li button:last-child {
+  background: rgba(10, 132, 255, 0.15);
+  border: 1px solid rgba(10, 132, 255, 0.3);
+  color: var(--apple-system-blue);
+  font-size: 0.68rem;
+  padding: 0.1rem 0.35rem;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+}
+.host-subdirs li button:last-child:hover {
+  background: var(--apple-system-blue);
+  color: #fff;
+}
+
+/* =============================================================
+   DATA TABLES (iTUNES LIST VIEW STYLE)
+   ============================================================= */
+.host-browser-pane table,
+.track-pane table,
+.orphan-files-section table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+  text-align: left;
+}
+
+.host-browser-pane thead,
+.track-pane thead,
+.orphan-files-section thead {
+  position: sticky;
+  top: 0;
+  background: linear-gradient(180deg, #262629 0%, #1f1f22 100%);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  z-index: 6;
+}
+
+.host-browser-pane th,
+.track-pane th,
+.orphan-files-section th {
+  padding: 0.5rem 0.75rem;
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--apple-text-tertiary);
+  user-select: none;
+  border-right: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.host-browser-pane td,
+.track-pane td,
+.orphan-files-section td {
+  padding: 0.45rem 0.75rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  color: var(--apple-text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+}
+
+/* Zebra striping like classic iTunes */
+.track-pane tbody tr:nth-child(even),
+.host-browser-pane tbody tr:nth-child(even) {
+  background-color: var(--apple-bg-row-alt);
+}
+
+.track-pane tr:hover td,
+.host-browser-pane tr:hover td,
+.orphan-files-section tr:hover td {
+  background: var(--apple-bg-hover);
+  color: var(--apple-text-primary);
+}
+
+/* Selected Row in iTunes List View */
+.track-pane tr.selected td {
+  background: rgba(10, 132, 255, 0.25) !important;
+  color: #fff !important;
+}
+
+/* Star Ratings in Gold */
+td:has(span:contains("★")),
+td {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Apple Play Icon Buttons in Tables */
+table button[aria-label^="Play"] {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--apple-border-medium);
+  color: var(--apple-system-blue);
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-full);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.65rem;
+  cursor: pointer;
+  margin-right: 0.4rem;
+  transition: all 0.12s ease;
+}
+table button[aria-label^="Play"]:hover {
+  background: var(--apple-system-blue);
+  color: #fff;
+  border-color: var(--apple-system-blue);
+  box-shadow: 0 0 8px var(--apple-system-blue-glow);
+}
+
+/* Move Up / Down Buttons for Playlist Reorder */
+table button[aria-label^="Move"] {
+  background: transparent;
+  border: 1px solid var(--apple-border-subtle);
+  color: var(--apple-text-secondary);
+  font-size: 0.75rem;
+  padding: 0.1rem 0.4rem;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  margin: 0 2px;
+}
+table button[aria-label^="Move"]:hover:not(:disabled) {
+  background: var(--apple-bg-active);
+  color: #fff;
+}
+table button[aria-label^="Move"]:disabled {
+  opacity: 0.25;
+  cursor: not-allowed;
+}
+
+/* Stage Button in Host Table */
+table button:not([aria-label^="Play"]):not([aria-label^="Move"]) {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--apple-border-subtle);
+  color: var(--apple-text-primary);
+  padding: 0.2rem 0.5rem;
+  border-radius: var(--radius-xs);
+  font-size: 0.72rem;
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+table button:not([aria-label^="Play"]):not([aria-label^="Move"]):hover {
+  background: var(--apple-system-blue);
+  color: #fff;
+}
+
+/* =============================================================
+   MAIN CONTENT AREA (iTUNES SONGS PANE)
+   ============================================================= */
+.track-pane {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--apple-bg-content);
+  overflow-y: auto;
+  order: 3;
+}
+
+/* Search Bar (macOS Pill Input Style) */
+.track-pane-search-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem 1rem;
+  background: #171719;
+  border-bottom: 1px solid var(--apple-border-subtle);
+  gap: 1rem;
+}
+
+.search-input-wrapper {
+  position: relative;
+  flex: 1;
+  max-width: 440px;
+  display: flex;
+  align-items: center;
+}
+
+.search-icon {
+  position: absolute;
+  left: 0.65rem;
+  font-size: 0.75rem;
+  color: var(--apple-text-tertiary);
+  pointer-events: none;
+}
+
+.search-input-wrapper input {
+  width: 100%;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--apple-border-subtle);
+  color: #fff;
+  font-size: 0.82rem;
+  padding: 0.35rem 2rem 0.35rem 2rem;
+  border-radius: var(--radius-full);
+  transition: all 0.15s ease;
+}
+.search-input-wrapper input:focus {
+  background: rgba(0, 0, 0, 0.4);
+  border-color: var(--apple-system-blue);
+  box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.25);
+}
+
+.clear-search-btn {
+  position: absolute;
+  right: 0.65rem;
+  background: transparent;
+  border: none;
+  color: var(--apple-text-tertiary);
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+.clear-search-btn:hover {
+  color: #fff;
+}
+
+.search-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.track-counter-pill {
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--apple-text-secondary);
+  background: rgba(255, 255, 255, 0.06);
+  padding: 0.2rem 0.6rem;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--apple-border-subtle);
+  font-family: var(--font-mono);
+}
+
+.toggle-host-btn {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.08) 0%, rgba(255, 255, 255, 0.02) 100%);
+  border: 1px solid var(--apple-border-medium);
+  color: var(--apple-text-secondary);
+  font-size: 0.75rem;
+  padding: 0.25rem 0.6rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+.toggle-host-btn:hover {
+  color: #fff;
+  background: var(--apple-bg-active);
+}
+
+/* Sticky Toolbar (macOS Push Buttons) */
+.track-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 8;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  padding: 0.65rem 1rem;
+  background: rgba(26, 26, 29, 0.95);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--apple-border-subtle);
+}
+
+.track-toolbar button {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.08) 0%, rgba(255, 255, 255, 0.02) 100%);
+  border: 1px solid var(--apple-border-medium);
+  color: #fff;
+  padding: 0.32rem 0.75rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.78rem;
+  font-weight: 500;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+  transition: all 0.12s ease;
+}
+.track-toolbar button:not(:disabled):hover {
+  background: var(--apple-bg-active);
+  border-color: var(--apple-border-strong);
+}
+.track-toolbar button:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.export-destination-group,
+.add-to-playlist-group {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  background: rgba(0, 0, 0, 0.35);
+  padding: 0.15rem 0.45rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--apple-border-subtle);
+}
+
+.export-destination-group label {
+  font-size: 0.72rem;
+  color: var(--apple-text-tertiary);
+}
+
+.export-destination-group input,
+.add-to-playlist-group select {
+  background: var(--apple-bg-input);
+  border: 1px solid var(--apple-border-subtle);
+  color: #fff;
+  font-size: 0.78rem;
+  padding: 0.2rem 0.45rem;
+  border-radius: var(--radius-xs);
+}
+
+/* =============================================================
+   SYNC BATCH PANEL
+   ============================================================= */
+.sync-batch-panel {
+  margin: 0.85rem 1rem;
+  padding: 0.85rem;
+  background: #171920;
+  border: 1px solid rgba(10, 132, 255, 0.3);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+.sync-batch-panel h2 {
+  font-size: 0.88rem;
+  font-weight: 700;
+  color: var(--apple-system-blue);
+  margin-bottom: 0.65rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.sync-batch-panel h2::before {
+  content: "⚡";
+}
+
+.sync-batch-panel ul {
+  list-style: none;
+  max-height: 160px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-bottom: 0.65rem;
+}
+
+.sync-batch-panel li {
+  background: rgba(255, 255, 255, 0.05);
+  padding: 0.35rem 0.65rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.78rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.duplicate-badge {
+  background: rgba(255, 159, 10, 0.2);
+  color: var(--apple-system-orange);
+  border: 1px solid rgba(255, 159, 10, 0.4);
+  font-size: 0.68rem;
+  padding: 0.1rem 0.35rem;
+  border-radius: var(--radius-xs);
+  font-weight: 600;
+}
+
+.sync-batch-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.45rem;
+}
+
+.sync-batch-actions button {
+  background: linear-gradient(180deg, #0a84ff 0%, #0071e3 100%);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  padding: 0.4rem 0.95rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3), 0 0 10px var(--apple-system-blue-glow);
+  transition: all 0.12s ease;
+}
+.sync-batch-actions button:hover {
+  background: linear-gradient(180deg, #0071e3 0%, #005bb5 100%);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4), 0 0 14px var(--apple-system-blue-glow);
+}
+
+.sync-batch-actions .dev-only-button {
+  background: transparent;
+  border: 1px dashed var(--apple-border-medium);
+  color: var(--apple-text-tertiary);
+  box-shadow: none;
+}
+
+/* =============================================================
+   ORPHAN FILES SECTION
+   ============================================================= */
+.orphan-files-section {
+  margin: 0.85rem 1rem;
+  padding: 0.85rem;
+  background: #1e1b18;
+  border: 1px solid rgba(255, 159, 10, 0.3);
+  border-radius: var(--radius-lg);
+}
+
+.orphan-files-section h2 {
+  font-size: 0.85rem;
+  font-weight: 700;
+  color: var(--apple-system-orange);
+  margin-bottom: 0.65rem;
+}
+
+/* =============================================================
+   MINI AUDIO PLAYER BAR (iTUNES BOTTOM DOCK)
+   ============================================================= */
+.mini-audio-player-bar {
+  height: 64px;
+  background: linear-gradient(180deg, #242427 0%, #1a1a1d 100%);
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 -2px 10px rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 1.25rem;
+  user-select: none;
+  z-index: 20;
+  gap: 1.25rem;
+}
+
+/* Left: Now Playing Metadata */
+.player-track-info {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  min-width: 200px;
+  max-width: 300px;
+}
+
+.player-source-badge {
+  font-size: 0.65rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 0.15rem 0.45rem;
+  border-radius: var(--radius-xs);
+}
+.player-source-badge.host {
+  background: rgba(10, 132, 255, 0.15);
+  color: var(--apple-system-blue);
+  border: 1px solid rgba(10, 132, 255, 0.3);
+}
+.player-source-badge.device {
+  background: rgba(191, 90, 242, 0.15);
+  color: var(--apple-system-purple);
+  border: 1px solid rgba(191, 90, 242, 0.3);
+}
+
+.player-track-info > div {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.player-track-title {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #fff;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.player-track-artist-album {
+  font-size: 0.72rem;
+  color: var(--apple-text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.player-idle {
+  color: var(--apple-text-tertiary);
+  font-size: 0.78rem;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.player-idle::before {
+  content: "♫";
+  font-size: 0.95rem;
+}
+
+/* Center: Transport Controls */
+.player-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  flex: 1;
+  max-width: 580px;
+  justify-content: center;
+}
+
+.player-controls button {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.1) 0%, rgba(255, 255, 255, 0.03) 100%);
+  border: 1px solid var(--apple-border-medium);
+  color: #fff;
+  width: 30px;
+  height: 30px;
+  border-radius: var(--radius-full);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+  transition: all 0.12s ease;
+}
+.player-controls button:hover:not(:disabled) {
+  background: var(--apple-system-blue);
+  border-color: var(--apple-system-blue);
+  color: #fff;
+  box-shadow: 0 0 10px var(--apple-system-blue-glow);
+}
+.player-controls button:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+.player-time {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--apple-text-secondary);
+  min-width: 70px;
+  text-align: center;
+}
+
+/* Apple Style Sliders (Scrubber & Volume) */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  background: rgba(255, 255, 255, 0.15);
+  height: 3px;
+  border-radius: var(--radius-full);
+  outline: none;
+  cursor: pointer;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 11px;
+  height: 11px;
+  border-radius: var(--radius-full);
+  background: #ffffff;
+  cursor: pointer;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+  transition: transform 0.1s ease;
+}
+input[type="range"]::-webkit-slider-thumb:hover {
+  transform: scale(1.25);
+}
+
+/* Seek Slider */
+input[aria-label="Seek track"] {
+  flex: 1;
+  min-width: 140px;
+}
+
+/* Volume Slider */
+input[aria-label="Volume"] {
+  width: 75px;
+}
+
+/* =============================================================
+   IN-PROGRESS & LOADING ANIMATIONS (APPLE DESKTOP STYLE)
+   ============================================================= */
+@keyframes appleSpin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+@keyframes pulseGlow {
+  0%, 100% { opacity: 0.6; transform: scale(0.98); }
+  50% { opacity: 1; transform: scale(1.02); }
+}
+
+@keyframes shimmerSlide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(200%); }
+}
+
+.spinner-icon {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid rgba(255, 255, 255, 0.25);
+  border-top-color: #ffffff;
+  border-radius: 50%;
+  animation: appleSpin 0.75s linear infinite;
+  vertical-align: middle;
+  margin-right: 0.35rem;
+}
+
+.track-spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid rgba(10, 132, 255, 0.3);
+  border-top-color: var(--apple-system-blue);
+  border-radius: 50%;
+  animation: appleSpin 0.65s linear infinite;
+  box-shadow: 0 0 6px var(--apple-system-blue-glow);
+}
+
+.track-play-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 26px;
+  min-height: 26px;
+  padding: 0;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--apple-border-subtle);
+  color: var(--apple-text-secondary);
+  transition: all 0.12s ease;
+}
+.track-play-btn:hover {
+  background: var(--apple-system-blue);
+  border-color: var(--apple-system-blue);
+  color: #fff;
+}
+.track-play-btn.is-loading {
+  background: rgba(10, 132, 255, 0.18) !important;
+  border-color: var(--apple-system-blue) !important;
+}
+.track-play-btn.is-playing {
+  color: var(--apple-system-blue);
+  border-color: rgba(10, 132, 255, 0.5);
+  background: rgba(10, 132, 255, 0.12);
+}
+
+/* Bottom Player Bar Buffering Badge */
+.player-buffering-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--apple-system-orange);
+  background: rgba(255, 159, 10, 0.15);
+  border: 1px solid rgba(255, 159, 10, 0.35);
+  padding: 0.15rem 0.5rem;
+  border-radius: var(--radius-xs);
+  animation: pulseGlow 1.5s ease-in-out infinite;
+}
+
+.spinner-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  background-color: var(--apple-system-orange);
+  border-radius: 50%;
+  box-shadow: 0 0 6px var(--apple-system-orange);
+  animation: appleSpin 1s infinite linear;
+}
+
+/* Indeterminate Shimmer for LCD and Scrubber */
+.lcd-progress-track.lcd-indeterminate {
+  position: relative;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+}
+
+.lcd-progress-shimmer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 50%;
+  height: 100%;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--apple-system-blue) 50%,
+    transparent 100%
+  );
+  animation: shimmerSlide 1.2s ease-in-out infinite;
+}
+
+.lcd-buffering-pulse {
+  color: var(--apple-system-orange) !important;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  animation: pulseGlow 1.2s ease-in-out infinite;
+}
+
+.lcd-spinner-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--apple-system-orange);
+  display: inline-block;
+  box-shadow: 0 0 6px var(--apple-system-orange);
+}
+
+/* Buttons with loading state */
+.btn-loading {
+  opacity: 0.85;
+  cursor: wait !important;
+  display: inline-flex !important;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+/* Scrubber buffering animation */
+.player-controls.is-buffering input[aria-label="Seek track"] {
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.15) 0%,
+    rgba(255, 159, 10, 0.5) 50%,
+    rgba(255, 255, 255, 0.15) 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmerSlide 1.5s linear infinite;
+}
+
+.player-controls label[for="player-volume-slider"] {
+  font-size: 0.7rem;
+  color: var(--apple-text-tertiary);
+  margin-left: 0.3rem;
+}
+
+/* Right: Status Indicators (macOS System Pills) */
+.player-dock-status {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  margin-left: auto;
+}
+
+.status-pill {
+  font-size: 0.7rem;
+  font-weight: 500;
+  padding: 0.2rem 0.55rem;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--apple-border-subtle);
+  background: rgba(0, 0, 0, 0.3);
+  color: var(--apple-text-secondary);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  white-space: nowrap;
+}
+
+.status-pill.synced {
+  color: var(--apple-system-green);
+  border-color: rgba(48, 209, 88, 0.3);
+}
+
+.status-pill.pending {
+  color: var(--apple-system-orange);
+  border-color: rgba(255, 159, 10, 0.3);
+}
+
+.status-pill.offline {
+  color: var(--apple-system-red);
+  border-color: rgba(255, 69, 58, 0.3);
+}
+
+.status-pill.ipc-status {
+  color: var(--apple-system-blue);
+  border-color: rgba(10, 132, 255, 0.3);
+  font-family: var(--font-mono);
+}
+
+.status-pill.tracks-count {
+  font-family: var(--font-mono);
+  color: #fff;
+}
+
+/* =============================================================
+   MODALS (macOS SHEETS & ALERTS)
+   ============================================================= */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  backdrop-filter: blur(10px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  animation: fadeIn 0.15s ease-out;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.modal-content {
+  background: #252528;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: var(--radius-xl);
+  padding: 1.5rem;
+  width: 100%;
+  max-width: 460px;
+  box-shadow: var(--apple-shadow-window);
+  max-height: 90vh;
+  overflow-y: auto;
+}
+
+.modal-content h3 {
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: #fff;
+  margin-bottom: 1rem;
+}
+
+.modal-content form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.modal-content form > div {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.modal-content form label {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--apple-text-secondary);
+}
+
+.modal-content form input:not([type="checkbox"]) {
+  background: var(--apple-bg-input);
+  border: 1px solid var(--apple-border-strong);
+  color: #fff;
+  font-size: 0.82rem;
+  padding: 0.4rem 0.6rem;
+  border-radius: var(--radius-sm);
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.65rem;
+  margin-top: 1.25rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid var(--apple-border-subtle);
+}
+
+.modal-actions button {
+  padding: 0.38rem 0.95rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.8rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+
+.modal-actions button[type="submit"],
+.modal-actions button:first-child {
+  background: linear-gradient(180deg, #0a84ff 0%, #0071e3 100%);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+}
+.modal-actions button[type="submit"]:hover,
+.modal-actions button:first-child:hover {
+  background: linear-gradient(180deg, #0071e3 0%, #005bb5 100%);
+}
+
+.modal-actions button[type="button"]:last-child {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.08) 0%, rgba(255, 255, 255, 0.02) 100%);
+  border: 1px solid var(--apple-border-medium);
+  color: var(--apple-text-secondary);
+}
+.modal-actions button[type="button"]:last-child:hover {
+  background: var(--apple-bg-active);
+  color: #fff;
+}
+
+/* =============================================================
+   macOS SETUP ASSISTANT / EMPTY & DISCONNECTED STATES
+   ============================================================= */
+.disconnected-view,
+.uninitialized-view {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100vh;
+  text-align: center;
+  padding: 2rem;
+  background: radial-gradient(circle at center 35%, #25252a 0%, #161618 70%);
+}
+
+.empty-state-card,
+.init-wizard-card {
+  background: #202024;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: var(--radius-xl);
+  padding: 2.5rem 3rem;
+  max-width: 500px;
+  width: 100%;
+  box-shadow: var(--apple-shadow-window);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.ipod-illustration-badge,
+.wizard-badge {
+  background: rgba(10, 132, 255, 0.12);
+  color: var(--apple-system-blue);
+  border: 1px solid rgba(10, 132, 255, 0.3);
+  padding: 0.3rem 0.85rem;
+  border-radius: var(--radius-full);
+  font-size: 0.8rem;
+  font-weight: 700;
+  margin-bottom: 1.25rem;
+  letter-spacing: 0.02em;
+}
+
+.empty-state-card h1,
+.init-wizard-card h1 {
+  font-size: 1.8rem;
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  color: #fff;
+  margin-bottom: 0.5rem;
+}
+
+.empty-state-card p,
+.init-wizard-card p {
+  color: var(--apple-text-secondary);
+  font-size: 0.88rem;
+  line-height: 1.55;
+  margin-bottom: 1.25rem;
+}
+
+.empty-state-hint {
+  font-size: 0.72rem;
+  color: var(--apple-text-tertiary);
+  background: rgba(0, 0, 0, 0.25);
+  padding: 0.5rem 0.85rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--apple-border-subtle);
+  width: 100%;
+}
+
+.init-form-group {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  margin-top: 0.4rem;
+}
+
+.init-form-group input {
+  flex: 1;
+  background: var(--apple-bg-input);
+  border: 1px solid var(--apple-border-strong);
+  color: #fff;
+  padding: 0.45rem 0.75rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.85rem;
+}
+
+.init-form-group button {
+  background: linear-gradient(180deg, #0a84ff 0%, #0071e3 100%);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  padding: 0.45rem 1rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+.init-form-group button:hover {
+  background: linear-gradient(180deg, #0071e3 0%, #005bb5 100%);
+}
+
+/* =============================================================
+   DEBUG ACTIVITY LOGGER DRAWER
+   ============================================================= */
+.debug-header-toggle-btn,
+.debug-toggle-pill {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--apple-border-medium);
+  color: var(--apple-text-secondary);
+  font-size: 0.72rem;
+  padding: 0.25rem 0.65rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all 0.12s ease;
+  font-family: inherit;
+}
+.debug-header-toggle-btn:hover,
+.debug-toggle-pill:hover,
+.debug-header-toggle-btn.active,
+.debug-toggle-pill.active {
+  background: var(--apple-system-blue);
+  color: #fff;
+  border-color: var(--apple-system-blue);
+  box-shadow: 0 0 10px var(--apple-system-blue-glow);
+}
+
+.debug-log-drawer {
+  position: fixed;
+  bottom: 58px; /* Above player dock */
+  left: 0;
+  right: 0;
+  height: 280px;
+  background: rgba(20, 20, 24, 0.96);
+  backdrop-filter: blur(20px);
+  border-top: 2px solid var(--apple-system-blue);
+  box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.6);
+  display: flex;
+  flex-direction: column;
+  z-index: 50;
+  font-family: var(--font-mono);
+  animation: slideUp 0.15s ease-out;
+}
+
+@keyframes slideUp {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+.debug-log-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.45rem 1rem;
+  background: rgba(30, 30, 35, 0.95);
+  border-bottom: 1px solid var(--apple-border-subtle);
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.debug-log-title-cluster {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.debug-log-badge {
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--apple-system-blue);
+  background: rgba(10, 132, 255, 0.15);
+  padding: 0.15rem 0.4rem;
+  border-radius: var(--radius-xs);
+}
+
+.debug-log-count {
+  font-size: 0.72rem;
+  color: var(--apple-text-secondary);
+}
+
+.debug-log-toggle-label {
+  font-size: 0.72rem;
+  color: var(--apple-text-tertiary);
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  cursor: pointer;
+}
+
+.debug-log-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.debug-log-search {
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid var(--apple-border-medium);
+  color: #fff;
+  font-size: 0.72rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: var(--radius-xs);
+  width: 140px;
+}
+
+.debug-log-filter {
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid var(--apple-border-medium);
+  color: #fff;
+  font-size: 0.72rem;
+  padding: 0.2rem 0.4rem;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+}
+
+.debug-log-btn {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--apple-border-subtle);
+  color: var(--apple-text-primary);
+  font-size: 0.7rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: var(--radius-xs);
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+.debug-log-btn:hover {
+  background: var(--apple-bg-active);
+  color: #fff;
+}
+
+.debug-log-close {
+  background: transparent;
+  border: none;
+  color: var(--apple-text-tertiary);
+  font-size: 0.9rem;
+  cursor: pointer;
+  padding: 0.1rem 0.4rem;
+}
+.debug-log-close:hover {
+  color: #fff;
+}
+
+.debug-log-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0.4rem 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.debug-log-empty {
+  color: var(--apple-text-tertiary);
+  font-size: 0.75rem;
+  padding: 1.5rem;
+  text-align: center;
+}
+
+.debug-log-row {
+  display: flex;
+  align-items: baseline;
+  font-size: 0.72rem;
+  line-height: 1.4;
+  gap: 0.5rem;
+  padding: 0.15rem 0.3rem;
+  border-radius: var(--radius-xs);
+}
+.debug-log-row:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.debug-log-row.level-error {
+  color: var(--apple-system-red);
+  background: rgba(255, 69, 58, 0.08);
+}
+.debug-log-row.level-warn {
+  color: var(--apple-system-orange);
+}
+.debug-log-row.level-info {
+  color: var(--apple-text-primary);
+}
+
+.debug-log-time {
+  color: var(--apple-text-tertiary);
+  font-size: 0.65rem;
+  flex-shrink: 0;
+}
+
+.debug-log-cat {
+  font-size: 0.62rem;
+  font-weight: 700;
+  padding: 0.05rem 0.3rem;
+  border-radius: var(--radius-xs);
+  flex-shrink: 0;
+}
+.debug-log-cat.cat-audio {
+  background: rgba(100, 210, 255, 0.15);
+  color: var(--apple-system-teal);
+}
+.debug-log-cat.cat-ipc {
+  background: rgba(191, 90, 242, 0.15);
+  color: var(--apple-system-purple);
+}
+.debug-log-cat.cat-ui {
+  background: rgba(48, 209, 88, 0.15);
+  color: var(--apple-system-green);
+}
+.debug-log-cat.cat-system {
+  background: rgba(255, 159, 10, 0.15);
+  color: var(--apple-system-orange);
+}
+
+.debug-log-msg {
+  word-break: break-word;
+}
+
+.debug-log-details {
+  color: var(--apple-text-tertiary);
+  font-size: 0.68rem;
+  word-break: break-all;
+}
+
+/* =============================================================
+   ENHANCED CLICK ERGONOMICS & POINTER TARGETS
+   ============================================================= */
+.track-pane tbody tr,
+.host-browser-pane tbody tr,
+.orphan-files-section tbody tr {
+  cursor: pointer;
+  transition: background 0.08s ease;
+}
+.track-pane tbody tr:hover,
+.host-browser-pane tbody tr:hover,
+.orphan-files-section tbody tr:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+table button[aria-label^="Play"] {
+  width: 26px !important;
+  height: 26px !important;
+  min-width: 26px !important;
+  min-height: 26px !important;
+  font-size: 0.75rem !important;
+  cursor: pointer !important;
+}
+
+.player-controls button {
+  min-width: 44px !important;
+  height: 32px !important;
+  padding: 0 0.85rem !important;
+  border-radius: var(--radius-full) !important;
+  font-size: 0.78rem !important;
+  cursor: pointer !important;
+}
+
+/* =============================================================
+   RESPONSIVE WIDTH RULES (DESKTOP -> LAPTOP -> TABLET)
+   ============================================================= */
+
+/* Laptop / Medium Width (< 1280px) */
+@media (max-width: 1280px) {
+  .playlist-sidebar {
+    width: 200px;
+    min-width: 180px;
+  }
+  .host-browser-pane {
+    width: 300px;
+    min-width: 240px;
+  }
+  /* Hide secondary table columns gracefully in Device Tracks */
+  .track-pane table[aria-label="Device Tracks"] th:nth-child(6), /* Disc # */
+  .track-pane table[aria-label="Device Tracks"] td:nth-child(6),
+  .track-pane table[aria-label="Device Tracks"] th:nth-child(8), /* Year */
+  .track-pane table[aria-label="Device Tracks"] td:nth-child(8),
+  .track-pane table[aria-label="Device Tracks"] th:nth-child(10), /* Bitrate */
+  .track-pane table[aria-label="Device Tracks"] td:nth-child(10) {
+    display: none;
+  }
+}
+
+/* Compact Laptop / Tablet Landscape (< 1080px) */
+@media (max-width: 1080px) {
+  .device-header {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+  }
+  .device-header .header-status-panel {
+    width: 100%;
+    justify-content: space-between;
+  }
+  .header-lcd-display {
+    width: 100%;
+    max-width: none;
+  }
+  .storage-summary {
+    margin-left: 0;
+    text-align: right;
+  }
+  .host-browser-pane {
+    width: 280px;
+  }
+  .track-pane table[aria-label="Device Tracks"] th:nth-child(5), /* Track # */
+  .track-pane table[aria-label="Device Tracks"] td:nth-child(5),
+  .track-pane table[aria-label="Device Tracks"] th:nth-child(7), /* Genre */
+  .track-pane table[aria-label="Device Tracks"] td:nth-child(7) {
+    display: none;
+  }
+}
+
+/* Tablet Portrait (< 860px) */
+@media (max-width: 860px) {
+  .workspace {
+    flex-direction: column;
+  }
+  .playlist-sidebar {
+    width: 100%;
+    max-width: none;
+    max-height: 160px;
+    border-right: none;
+    border-bottom: 1px solid var(--apple-border-subtle);
+    order: 1;
+  }
+  .host-browser-pane {
+    width: 100%;
+    max-width: none;
+    max-height: 240px;
+    border-right: none;
+    border-bottom: 1px solid var(--apple-border-subtle);
+    order: 2;
+  }
+  .track-pane {
+    order: 3;
+  }
+  .mini-audio-player-bar {
+    flex-wrap: wrap;
+    height: auto;
+    padding: 0.65rem 1rem;
+    gap: 0.65rem;
+  }
+  .player-track-info {
+    min-width: 100%;
+    max-width: none;
+    order: 1;
+  }
+  .player-controls {
+    min-width: 100%;
+    max-width: none;
+    order: 2;
+  }
+  .player-dock-status {
+    min-width: 100%;
+    justify-content: flex-end;
+    order: 3;
+  }
+  .debug-log-drawer {
+    bottom: 140px;
+    height: 220px;
+  }
+}
+
+/* Small Screens (< 640px) */
+@media (max-width: 640px) {
+  .device-title-row {
+    flex-wrap: wrap;
+  }
+  .guid-controls {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .guid-controls input {
+    width: 100%;
+  }
+  .track-toolbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .track-toolbar button {
+    width: 100%;
+  }
+  .track-pane table[aria-label="Device Tracks"] th:nth-child(4), /* Album */
+  .track-pane table[aria-label="Device Tracks"] td:nth-child(4),
+  .track-pane table[aria-label="Device Tracks"] th:nth-child(11), /* Play count */
+  .track-pane table[aria-label="Device Tracks"] td:nth-child(11) {
+    display: none;
+  }
+  .debug-log-controls {
+    flex-wrap: wrap;
+  }
+}

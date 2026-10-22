@@ -239,6 +239,16 @@ impl<A: HardwareDeviceAdapter> AppState<A> {
         guard.play_host_file(&host_file).map_err(|e| e.to_string())
     }
 
+    pub fn get_cached_session(&self) -> Option<DeviceSession> {
+        let guard = self.engine.lock().ok()?;
+        guard.get_cached_session()
+    }
+
+    pub fn get_device_track_path(&self, track_id: u32) -> Result<PathBuf, String> {
+        let guard = self.engine.lock().map_err(|e| e.to_string())?;
+        guard.get_device_track_path(track_id).map_err(|e| e.to_string())
+    }
+
     pub fn play_device_track(&self, track_id: u32) -> Result<PlaybackStatus, String> {
         let guard = self.engine.lock().map_err(|e| e.to_string())?;
         guard.play_device_track(track_id).map_err(|e| e.to_string())

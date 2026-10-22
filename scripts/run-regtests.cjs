@@ -97,7 +97,21 @@ async function main() {
   await waitForHttp("http://127.0.0.1:41731/api/scan_device");
   console.log("✓ Backend server listening on http://127.0.0.1:41731");
 
-  // Verify frontend is ready
+  // Verify frontend is ready, spawn vite if needed
+  let viteProc = null;
+  try {
+    const res = await fetch("http://localhost:5173/");
+    if (res.ok) {
+      console.log("✓ Existing Vite dev server detected on http://localhost:5173");
+    }
+  } catch (_) {
+    console.log("▶ Spawning Vite dev server on http://localhost:5173...");
+    viteProc = spawn("npx", ["vite", "--port", "5173"], {
+      cwd: ROOT_DIR,
+      stdio: "pipe",
+    });
+  }
+
   await waitForHttp("http://localhost:5173/");
   console.log("✓ Frontend Vite server running on http://localhost:5173");
 
@@ -361,8 +375,9 @@ async function main() {
     console.log("\n[6/6] Generating regression test dashboard report...");
     generateReports();
 
-    // Cleanup background backend process
+    // Cleanup background backend and vite process
     backendProc.kill();
+    if (viteProc) viteProc.kill();
 
     console.log("\n==========================================================");
     console.log(" ✅ ALL REGRESSION TESTS PASSED (Tickets #2 through #7)");
@@ -381,6 +396,7 @@ async function main() {
       await browser.close();
     } catch (_) {}
     backendProc.kill();
+    if (viteProc) viteProc.kill();
     throw err;
   }
 }
@@ -456,7 +472,11 @@ ${screenshots.map((s) => `  - \`regtest-artifacts/screenshots/${s}\``).join("\n"
   fs.writeFileSync(path.join(ARTIFACTS_DIR, "REPORT.md"), reportMd);
 }
 
-main().catch((err) => {
-  console.error("\n❌ Regression test suite failed:", err);
-  process.exit(1);
-});
+main()
+  .then(() => {
+    process.exit(0);
+  })
+  .catch((err) => {
+    console.error("\n❌ Regression test suite failed:", err);
+    process.exit(1);
+  });

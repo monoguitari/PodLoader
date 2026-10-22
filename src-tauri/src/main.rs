@@ -17,7 +17,7 @@ fn main() {
         }
     }
 
-    let state = AppState::default();
+    let state = std::sync::Arc::new(AppState::default());
 
     if let Some(pos) = args.iter().position(|a| a == "--setup-regtest") {
         if let Some(base_dir_str) = args.get(pos + 1) {
@@ -55,7 +55,7 @@ fn main() {
     }
 
     if args.iter().any(|a| a == "--serve") {
-        run_dev_bridge_server(&state);
+        run_dev_bridge_server(std::sync::Arc::clone(&state));
         return;
     }
 
@@ -141,17 +141,138 @@ fn main() {
     }
 }
 
-fn run_dev_bridge_server(state: &AppState) {
+fn run_dev_bridge_server(state: std::sync::Arc<AppState>) {
     let addr = "127.0.0.1:41731";
     let listener = TcpListener::bind(addr).expect("bind dev bridge server on 127.0.0.1:41731");
     println!("PodLoader Rust backend listening on http://{}", addr);
 
     for stream in listener.incoming().flatten() {
-        let _ = handle_http_client(stream, state);
+        let state = std::sync::Arc::clone(&state);
+        std::thread::spawn(move || {
+            let _ = handle_http_client(stream, &state);
+        });
     }
 }
 
-fn read_http_request(stream: &mut std::net::TcpStream) -> std::io::Result<(String, String)> {
+fn url_decode(s: &str) -> String {
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        } else if bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn stream_audio_file(
+    mut stream: std::net::TcpStream,
+    path: &std::path::Path,
+    range_header: Option<&str>,
+) -> std::io::Result<()> {
+    use std::io::Seek;
+    if !path.exists() {
+        let resp = "HTTP/1.1 404 Not Found\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        stream.write_all(resp.as_bytes())?;
+        return Ok(());
+    }
+
+    if podloader_core::transcode::is_alac_file(path) {
+        if let Err(err) = podloader_core::transcode::stream_audio_pcm_wav(path, range_header, &mut stream) {
+            eprintln!("Error streaming ALAC audio as WAV: {}", err);
+        }
+        return Ok(());
+    }
+
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => {
+            let resp = "HTTP/1.1 404 Not Found\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            stream.write_all(resp.as_bytes())?;
+            return Ok(());
+        }
+    };
+
+    let total_len = file.metadata()?.len();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let content_type = match ext.as_str() {
+        "mp3" => "audio/mpeg",
+        "m4a" | "mp4" | "aac" | "alac" => "audio/mp4",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "ogg" | "opus" => "audio/ogg",
+        _ => "audio/mp4",
+    };
+
+    if let Some(range_val) = range_header {
+        if let Some(bytes_range) = range_val.strip_prefix("bytes=") {
+            let parts: Vec<&str> = bytes_range.split('-').collect();
+            let start = parts.first().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            let end = parts
+                .get(1)
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(total_len.saturating_sub(1))
+                .min(total_len.saturating_sub(1));
+
+            if start <= end && start < total_len {
+                let chunk_len = end - start + 1;
+                file.seek(std::io::SeekFrom::Start(start))?;
+                let header = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Type: {}\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+                    content_type, start, end, total_len, chunk_len
+                );
+                stream.write_all(header.as_bytes())?;
+
+                let mut to_read = chunk_len;
+                let mut buf = [0u8; 64 * 1024];
+                while to_read > 0 {
+                    let max = (to_read as usize).min(buf.len());
+                    let n = file.read(&mut buf[..max])?;
+                    if n == 0 {
+                        break;
+                    }
+                    stream.write_all(&buf[..n])?;
+                    to_read -= n as u64;
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+        content_type, total_len
+    );
+    stream.write_all(header.as_bytes())?;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        stream.write_all(&buf[..n])?;
+    }
+    Ok(())
+}
+
+fn read_http_request(
+    stream: &mut std::net::TcpStream,
+) -> std::io::Result<(String, String, std::collections::HashMap<String, String>)> {
     let mut data = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
     let mut header_end: Option<usize> = None;
@@ -189,30 +310,75 @@ fn read_http_request(stream: &mut std::net::TcpStream) -> std::io::Result<(Strin
     let Some(end) = header_end else {
         let text = String::from_utf8_lossy(&data);
         let first = text.lines().next().unwrap_or("").to_string();
-        return Ok((first, "{}".to_string()));
+        return Ok((first, "{}".to_string(), std::collections::HashMap::new()));
     };
 
     let headers_str = String::from_utf8_lossy(&data[..end - 4]);
     let first_line = headers_str.lines().next().unwrap_or("").to_string();
+    let mut headers = std::collections::HashMap::new();
+    for line in headers_str.lines().skip(1) {
+        if let Some((k, v)) = line.split_once(':') {
+            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+        }
+    }
+
     let body_slice = data.get(end..end + content_length).unwrap_or(&data[end..]);
     let body = if body_slice.is_empty() {
         "{}".to_string()
     } else {
         String::from_utf8_lossy(body_slice).to_string()
     };
-    Ok((first_line, body))
+    Ok((first_line, body, headers))
 }
 
 fn handle_http_client(mut stream: std::net::TcpStream, state: &AppState) -> std::io::Result<()> {
-    let (first_line, body) = read_http_request(&mut stream)?;
+    let (first_line, body, headers) = read_http_request(&mut stream)?;
     if first_line.is_empty() {
         return Ok(());
     }
 
     if first_line.starts_with("OPTIONS ") {
-        let resp = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nConnection: close\r\n\r\n";
+        let resp = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, Range\r\nAccess-Control-Expose-Headers: Content-Range, Accept-Ranges, Content-Length\r\nConnection: close\r\n\r\n";
         stream.write_all(resp.as_bytes())?;
         return Ok(());
+    }
+
+    if first_line.starts_with("GET /api/audio_stream") {
+        let range = headers.get("range").map(|s| s.as_str());
+        let uri = first_line.split_whitespace().nth(1).unwrap_or("");
+        let query = uri.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let mut target_path: Option<std::path::PathBuf> = None;
+
+        for pair in query.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                if k == "path" {
+                    let decoded = url_decode(v);
+                    target_path = Some(std::path::PathBuf::from(decoded));
+                } else if k == "trackId" {
+                    if let Ok(tid) = v.parse::<u32>() {
+                        if let Ok(path) = state.get_device_track_path(tid) {
+                            target_path = Some(path);
+                        }
+                    }
+                }
+            }
+        }
+
+        if target_path.is_none() {
+            if let Ok(status) = state.get_playback_status() {
+                if let Some(active) = status.track {
+                    target_path = Some(active.source_path);
+                }
+            }
+        }
+
+        if let Some(path) = target_path {
+            return stream_audio_file(stream, &path, range);
+        } else {
+            let resp = "HTTP/1.1 404 Not Found\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            stream.write_all(resp.as_bytes())?;
+            return Ok(());
+        }
     }
 
     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();

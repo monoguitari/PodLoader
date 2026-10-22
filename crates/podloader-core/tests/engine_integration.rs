@@ -3142,6 +3142,69 @@ fn plays_host_files_and_device_tracks_with_state_transitions_seeking_volume_and_
     assert!(status_after_eject.track.is_none());
 }
 
+#[test]
+fn test_stream_audio_pcm_wav_streaming_and_range_requests() {
+    let p_real = std::path::Path::new("/mnt/d/iPod_Control/Music/F00/RCAY.m4a");
+    let temp_dir;
+    let p = if p_real.exists() {
+        p_real.to_path_buf()
+    } else {
+        temp_dir = tempfile::tempdir().expect("tempdir");
+        let sample_wav = temp_dir.path().join("sample.wav");
+        let mut wav_bytes = Vec::new();
+        wav_bytes.extend_from_slice(b"RIFF");
+        wav_bytes.extend_from_slice(&((44 + 44100 * 4 - 8) as u32).to_le_bytes());
+        wav_bytes.extend_from_slice(b"WAVEfmt ");
+        wav_bytes.extend_from_slice(&16u32.to_le_bytes());
+        wav_bytes.extend_from_slice(&1u16.to_le_bytes());
+        wav_bytes.extend_from_slice(&2u16.to_le_bytes());
+        wav_bytes.extend_from_slice(&44100u32.to_le_bytes());
+        wav_bytes.extend_from_slice(&(44100u32 * 4).to_le_bytes());
+        wav_bytes.extend_from_slice(&4u16.to_le_bytes());
+        wav_bytes.extend_from_slice(&16u16.to_le_bytes());
+        wav_bytes.extend_from_slice(b"data");
+        wav_bytes.extend_from_slice(&(44100u32 * 4).to_le_bytes());
+        wav_bytes.resize(44 + 44100 * 4, 0);
+        std::fs::write(&sample_wav, &wav_bytes).expect("write wav");
+        let hf = podloader_core::HostFile {
+            path: sample_wav,
+            file_name: "sample.wav".to_string(),
+            format: "WAV".to_string(),
+            file_size: wav_bytes.len() as u64,
+            title: "Sample".to_string(),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
+            track_number: 1,
+            disc_number: 1,
+            genre: "Test".to_string(),
+            year: 2024,
+            duration_ms: 1000,
+            bitrate_kbps: 1411,
+        };
+        let out_m4a = temp_dir.path().join("output.m4a");
+        let _ = podloader_core::transcode::transcode_to_alac_m4a(&hf, &out_m4a, |_, _| {}).expect("transcode ALAC");
+        out_m4a
+    };
+
+    assert!(podloader_core::transcode::is_alac_file(&p));
+
+    // Test 1: Header range bytes=0-43
+    let mut initial_out = Vec::new();
+    let res = podloader_core::transcode::stream_audio_pcm_wav(&p, Some("bytes=0-43"), &mut initial_out);
+    assert!(res.is_ok());
+    let initial_str = String::from_utf8_lossy(&initial_out);
+    assert!(initial_str.starts_with("HTTP/1.1 206 Partial Content\r\nContent-Type: audio/wav\r\n"));
+    assert!(initial_out.windows(4).any(|w| w == b"data"));
+
+    // Test 2: Seek request into audio stream
+    let mut seek_out = Vec::new();
+    let res_seek = podloader_core::transcode::stream_audio_pcm_wav(&p, Some("bytes=1000-5095"), &mut seek_out);
+    assert!(res_seek.is_ok());
+    let seek_str = String::from_utf8_lossy(&seek_out);
+    assert!(seek_str.starts_with("HTTP/1.1 206 Partial Content\r\nContent-Type: audio/wav\r\n"));
+    assert!(seek_str.contains("Content-Length: 4096"));
+}
+
 
 
 

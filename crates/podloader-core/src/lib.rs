@@ -233,26 +233,78 @@ impl HardwareDeviceAdapter for SystemHardwareDeviceAdapter {
         #[cfg(target_os = "linux")]
         {
             let _ = std::process::Command::new("sync").status();
-            let _ = std::process::Command::new("eject").arg(mount_path).status();
+
+            let path_str = mount_path.to_string_lossy();
+            let mut ejected_via_wsl_powershell = false;
+
+            // Detect WSL Windows drive mounts such as /mnt/d or /mnt/e
+            if let Some(rest) = path_str.strip_prefix("/mnt/") {
+                let trimmed = rest.trim_end_matches(['/', '\\']);
+                if trimmed.len() == 1 && trimmed.chars().all(|c| c.is_ascii_alphabetic()) {
+                    let drive_letter = format!("{}:", trimmed.to_ascii_uppercase());
+                    if let Ok(mut child) = std::process::Command::new("powershell.exe")
+                        .current_dir("/mnt/c")
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .args([
+                            "-NoProfile",
+                            "-Command",
+                            &format!(
+                                "(New-Object -comObject Shell.Application).Namespace(17).ParseName('{}').InvokeVerb('Eject')",
+                                drive_letter
+                            ),
+                        ])
+                        .spawn()
+                    {
+                        if let Ok(status) = child.wait() {
+                            if status.success() {
+                                ejected_via_wsl_powershell = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !ejected_via_wsl_powershell {
+                let _ = std::process::Command::new("eject")
+                    .arg(mount_path)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
         }
         #[cfg(target_os = "macos")]
         {
             let _ = std::process::Command::new("sync").status();
             let _ = std::process::Command::new("diskutil")
                 .args(["eject", &mount_path.to_string_lossy()])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .status();
         }
         #[cfg(target_os = "windows")]
         {
+            let drive_path = mount_path.to_string_lossy();
+            let drive_name = if drive_path.len() >= 2 && &drive_path[1..2] == ":" {
+                format!("{}:", &drive_path[0..1].to_ascii_uppercase())
+            } else {
+                drive_path.to_string()
+            };
             let _ = std::process::Command::new("powershell")
                 .args([
                     "-NoProfile",
                     "-Command",
                     &format!(
                         "(New-Object -comObject Shell.Application).Namespace(17).ParseName('{}').InvokeVerb('Eject')",
-                        mount_path.to_string_lossy()
+                        drive_name
                     ),
                 ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .status();
         }
         Ok(())
@@ -601,6 +653,7 @@ struct InterruptedJournal {
 #[derive(Debug, Default, Clone)]
 struct EngineState {
     active_mount_path: Option<PathBuf>,
+    cached_session: Option<DeviceSession>,
     sync_batch: SyncBatch,
     next_staged_id: u64,
     next_obfuscated_counter: u64,
@@ -630,6 +683,7 @@ impl<A: HardwareDeviceAdapter, S: AudioSinkAdapter> PodLoaderEngine<A, S> {
             active_track: RefCell::new(None),
             state: RefCell::new(EngineState {
                 active_mount_path: None,
+                cached_session: None,
                 sync_batch: SyncBatch::default(),
                 next_staged_id: 1,
                 next_obfuscated_counter: 1,
@@ -648,7 +702,9 @@ impl<A: HardwareDeviceAdapter, S: AudioSinkAdapter> PodLoaderEngine<A, S> {
             .find(|v| !st.ejected_mount_paths.contains(&v.mount_path))
         else {
             drop(st);
-            self.state.borrow_mut().active_mount_path = None;
+            let mut st = self.state.borrow_mut();
+            st.active_mount_path = None;
+            st.cached_session = None;
             return Ok(DeviceConnectionState::Disconnected);
         };
         drop(st);
@@ -660,7 +716,9 @@ impl<A: HardwareDeviceAdapter, S: AudioSinkAdapter> PodLoaderEngine<A, S> {
             .join("iTunesDB");
 
         if !itunesdb_path.is_file() {
-            self.state.borrow_mut().active_mount_path = None;
+            let mut st = self.state.borrow_mut();
+            st.active_mount_path = None;
+            st.cached_session = None;
             return Ok(DeviceConnectionState::UninitializedVolume(vol));
         }
 
@@ -1443,7 +1501,7 @@ impl<A: HardwareDeviceAdapter, S: AudioSinkAdapter> PodLoaderEngine<A, S> {
 
         let orphan_files = scan_orphan_files(&vol.mount_path, &library);
 
-        Ok(DeviceConnectionState::Connected(DeviceSession {
+        let session = DeviceSession {
             device: DeviceMetadata {
                 mount_path: vol.mount_path,
                 name: master_name,
@@ -1460,7 +1518,9 @@ impl<A: HardwareDeviceAdapter, S: AudioSinkAdapter> PodLoaderEngine<A, S> {
             transcode_preset,
             ffmpeg_available: self.adapter.is_ffmpeg_available(),
             orphan_files,
-        }))
+        };
+        self.state.borrow_mut().cached_session = Some(session.clone());
+        Ok(DeviceConnectionState::Connected(session))
     }
 
     fn mutate_itunesdb<F, R>(&mut self, f: F) -> Result<R, PodLoaderError>
@@ -1624,6 +1684,7 @@ impl<A: HardwareDeviceAdapter, S: AudioSinkAdapter> PodLoaderEngine<A, S> {
         let mut st = self.state.borrow_mut();
         st.ejected_mount_paths.push(mount_path);
         st.active_mount_path = None;
+        st.cached_session = None;
         st.sync_batch = SyncBatch::default();
         st.interrupted_journal = None;
         Ok(())
@@ -1673,21 +1734,105 @@ impl<A: HardwareDeviceAdapter, S: AudioSinkAdapter> PodLoaderEngine<A, S> {
         })
     }
 
-    pub fn play_device_track(&self, track_id: u32) -> Result<PlaybackStatus, PodLoaderError> {
-        let current = match self.scan_device()? {
-            DeviceConnectionState::Connected(session) => session,
-            _ => return Err(PodLoaderError::NoActiveDevice),
+    pub fn get_cached_session(&self) -> Option<DeviceSession> {
+        self.state.borrow().cached_session.clone()
+    }
+
+    pub fn get_device_track_path(&self, track_id: u32) -> Result<PathBuf, PodLoaderError> {
+        let (mount_path, track) = {
+            let st = self.state.borrow();
+            if let Some(ref session) = st.cached_session {
+                if let Some(t) = session.library.tracks.iter().find(|tr| tr.id == track_id) {
+                    (session.device.mount_path.clone(), t.clone())
+                } else {
+                    drop(st);
+                    let current = match self.scan_device()? {
+                        DeviceConnectionState::Connected(session) => session,
+                        _ => return Err(PodLoaderError::NoActiveDevice),
+                    };
+                    let t = current
+                        .library
+                        .tracks
+                        .iter()
+                        .find(|tr| tr.id == track_id)
+                        .ok_or_else(|| {
+                            PodLoaderError::DeviceOperationFailed(format!("Track {} not found", track_id))
+                        })?
+                        .clone();
+                    (current.device.mount_path.clone(), t)
+                }
+            } else {
+                drop(st);
+                let current = match self.scan_device()? {
+                    DeviceConnectionState::Connected(session) => session,
+                    _ => return Err(PodLoaderError::NoActiveDevice),
+                };
+                let t = current
+                    .library
+                    .tracks
+                    .iter()
+                    .find(|tr| tr.id == track_id)
+                    .ok_or_else(|| {
+                        PodLoaderError::DeviceOperationFailed(format!("Track {} not found", track_id))
+                    })?
+                    .clone();
+                (current.device.mount_path.clone(), t)
+            }
         };
-        let track = current
-            .library
-            .tracks
-            .iter()
-            .find(|t| t.id == track_id)
-            .ok_or_else(|| {
-                PodLoaderError::DeviceOperationFailed(format!("Track {} not found", track_id))
-            })?;
-        let disk_path =
-            obfuscated_to_disk_path(&current.device.mount_path, &track.obfuscated_path);
+
+        let disk_path = obfuscated_to_disk_path(&mount_path, &track.obfuscated_path);
+        if !disk_path.is_file() {
+            return Err(PodLoaderError::DeviceOperationFailed(format!(
+                "Audio file at {:?} not found",
+                disk_path
+            )));
+        }
+        Ok(disk_path)
+    }
+
+    pub fn play_device_track(&self, track_id: u32) -> Result<PlaybackStatus, PodLoaderError> {
+        let (mount_path, track) = {
+            let st = self.state.borrow();
+            if let Some(ref session) = st.cached_session {
+                if let Some(t) = session.library.tracks.iter().find(|tr| tr.id == track_id) {
+                    (session.device.mount_path.clone(), t.clone())
+                } else {
+                    drop(st);
+                    let current = match self.scan_device()? {
+                        DeviceConnectionState::Connected(session) => session,
+                        _ => return Err(PodLoaderError::NoActiveDevice),
+                    };
+                    let t = current
+                        .library
+                        .tracks
+                        .iter()
+                        .find(|tr| tr.id == track_id)
+                        .ok_or_else(|| {
+                            PodLoaderError::DeviceOperationFailed(format!("Track {} not found", track_id))
+                        })?
+                        .clone();
+                    (current.device.mount_path.clone(), t)
+                }
+            } else {
+                drop(st);
+                let current = match self.scan_device()? {
+                    DeviceConnectionState::Connected(session) => session,
+                    _ => return Err(PodLoaderError::NoActiveDevice),
+                };
+                let t = current
+                    .library
+                    .tracks
+                    .iter()
+                    .find(|tr| tr.id == track_id)
+                    .ok_or_else(|| {
+                        PodLoaderError::DeviceOperationFailed(format!("Track {} not found", track_id))
+                    })?
+                    .clone();
+                (current.device.mount_path.clone(), t)
+            }
+        };
+
+        let disk_path = obfuscated_to_disk_path(&mount_path, &track.obfuscated_path);
         if !disk_path.is_file() {
             return Err(PodLoaderError::DeviceOperationFailed(format!(
                 "Audio file at {:?} not found",

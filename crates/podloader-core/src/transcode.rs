@@ -3,11 +3,11 @@ use std::path::Path;
 
 use alac_encoder::{AlacEncoder, FormatDescription, DEFAULT_FRAMES_PER_PACKET};
 use symphonia::core::audio::sample::Sample;
-use symphonia::core::codecs::audio::well_known::CODEC_ID_OPUS;
+use symphonia::core::codecs::audio::well_known::{CODEC_ID_ALAC, CODEC_ID_OPUS};
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::probe::Hint;
-use symphonia::core::formats::{FormatOptions, FormatReader, TrackType};
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::{MetadataOptions, MetadataRevision, RawValue, StandardTag};
 
@@ -673,4 +673,218 @@ fn build_alac_m4a_container(
     out.extend_from_slice(&moov);
     out.extend_from_slice(&mdat);
     out
+}
+
+pub fn is_alac_file(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext != "m4a" && ext != "mp4" && ext != "alac" {
+        return false;
+    }
+    if let Ok(format) = open_symphonia_format(path) {
+        if let Some(track) = format.default_track(TrackType::Audio) {
+            if let Some(audio) = track.codec_params.as_ref().and_then(|p| p.audio()) {
+                return audio.codec == CODEC_ID_ALAC;
+            }
+        }
+    }
+    false
+}
+
+pub fn stream_audio_pcm_wav<W: std::io::Write>(
+    path: &Path,
+    range_header: Option<&str>,
+    mut writer: W,
+) -> Result<(), PodLoaderError> {
+    let mut format = match open_symphonia_format(path) {
+        Ok(f) => f,
+        Err(e) => {
+            let resp = "HTTP/1.1 500 Internal Server Error\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = writer.write_all(resp.as_bytes());
+            return Err(e);
+        }
+    };
+    let (track_id, codec_params, num_frames) = {
+        let track = match format.default_track(TrackType::Audio) {
+            Some(t) => t,
+            None => {
+                let resp = "HTTP/1.1 500 Internal Server Error\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = writer.write_all(resp.as_bytes());
+                return Err(PodLoaderError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "No audio track found in file",
+                )));
+            }
+        };
+        let audio = match track.codec_params.as_ref().and_then(|p| p.audio()) {
+            Some(a) => a.clone(),
+            None => {
+                let resp = "HTTP/1.1 500 Internal Server Error\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = writer.write_all(resp.as_bytes());
+                return Err(PodLoaderError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Missing audio codec parameters",
+                )));
+            }
+        };
+        (track.id, audio, track.num_frames.unwrap_or(0))
+    };
+
+    let sample_rate = codec_params.sample_rate.unwrap_or(44_100);
+    let channels = codec_params
+        .channels
+        .as_ref()
+        .map(|c| c.count() as u16)
+        .unwrap_or(2)
+        .clamp(1, 2);
+    let bits_per_sample = 16u16;
+    let bytes_per_sample = 2u32;
+    let bytes_per_frame = (channels as u32) * bytes_per_sample;
+    let byte_rate = (sample_rate as u32) * bytes_per_frame;
+    let block_align = channels * (bits_per_sample / 8);
+
+    let data_len: u32 = if num_frames > 0 {
+        (num_frames * (bytes_per_frame as u64)) as u32
+    } else {
+        0x7fff_0000
+    };
+    let riff_len = data_len.saturating_add(36);
+    let total_wav_len = 44u64 + (data_len as u64);
+
+    let mut wav_header = [0u8; 44];
+    wav_header[0..4].copy_from_slice(b"RIFF");
+    wav_header[4..8].copy_from_slice(&riff_len.to_le_bytes());
+    wav_header[8..12].copy_from_slice(b"WAVE");
+    wav_header[12..16].copy_from_slice(b"fmt ");
+    wav_header[16..20].copy_from_slice(&16u32.to_le_bytes());
+    wav_header[20..22].copy_from_slice(&1u16.to_le_bytes());
+    wav_header[22..24].copy_from_slice(&channels.to_le_bytes());
+    wav_header[24..28].copy_from_slice(&sample_rate.to_le_bytes());
+    wav_header[28..32].copy_from_slice(&byte_rate.to_le_bytes());
+    wav_header[32..34].copy_from_slice(&block_align.to_le_bytes());
+    wav_header[34..36].copy_from_slice(&bits_per_sample.to_le_bytes());
+    wav_header[36..40].copy_from_slice(b"data");
+    wav_header[40..44].copy_from_slice(&data_len.to_le_bytes());
+
+    let mut range_bounds: Option<(u64, u64)> = None;
+    if let Some(r_str) = range_header {
+        if let Some(spec) = r_str.strip_prefix("bytes=") {
+            let parts: Vec<&str> = spec.split('-').collect();
+            if let Some(start_str) = parts.first() {
+                if let Ok(s) = start_str.parse::<u64>() {
+                    let e = parts
+                        .get(1)
+                        .and_then(|es| es.parse::<u64>().ok())
+                        .unwrap_or(total_wav_len.saturating_sub(1))
+                        .min(total_wav_len.saturating_sub(1));
+                    if s <= e && s < total_wav_len {
+                        range_bounds = Some((s, e));
+                    }
+                }
+            }
+        }
+    }
+
+    let (req_start, req_end) = range_bounds.unwrap_or((0, total_wav_len.saturating_sub(1)));
+    let chunk_len = req_end - req_start + 1;
+
+    let http_status_header = if range_bounds.is_some() {
+        format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/wav\r\nAccept-Ranges: bytes\r\nContent-Range: bytes {}-{}/{}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+            req_start, req_end, total_wav_len, chunk_len
+        )
+    } else {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+            total_wav_len
+        )
+    };
+
+    if writer.write_all(http_status_header.as_bytes()).is_err() {
+        return Ok(());
+    }
+
+    if req_start < 44 {
+        let h_start = req_start as usize;
+        let h_end = ((req_end + 1) as usize).min(44);
+        if h_start < h_end {
+            if writer.write_all(&wav_header[h_start..h_end]).is_err() {
+                return Ok(());
+            }
+        }
+    }
+
+    if req_end < 44 {
+        return Ok(());
+    }
+
+    let audio_start_byte = req_start.saturating_sub(44);
+    let audio_end_byte = req_end.saturating_sub(44);
+    let mut audio_bytes_to_send = audio_end_byte - audio_start_byte + 1;
+
+    if audio_start_byte > 0 {
+        let target_frame = audio_start_byte / (bytes_per_frame as u64);
+        let target_sec = target_frame as f64 / (sample_rate as f64);
+        if target_sec > 0.05 {
+            let _ = format.seek(
+                SeekMode::Accurate,
+                SeekTo::Time {
+                    time: symphonia::core::units::Time::from(target_sec as u32),
+                    track_id: Some(track_id),
+                },
+            );
+        }
+    }
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(&codec_params, &AudioDecoderOptions::default())
+        .map_err(|e| {
+            PodLoaderError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                e.to_string(),
+            ))
+        })?;
+
+    let mut packet_buf: Vec<i16> = Vec::new();
+    while audio_bytes_to_send > 0 {
+        let packet = match format.next_packet() {
+            Ok(Some(pkt)) => pkt,
+            Ok(None) => break,
+            Err(SymphoniaError::IoError(ref err))
+                if err.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(_) => break,
+        };
+
+        if packet.track_id != track_id {
+            continue;
+        }
+
+        match decoder.decode(&packet) {
+            Ok(abuf) => {
+                let interleaved = abuf.samples_interleaved();
+                packet_buf.resize(interleaved, 0i16);
+                abuf.copy_to_slice_interleaved(&mut packet_buf);
+                let mut pcm_bytes = Vec::with_capacity(packet_buf.len() * 2);
+                for s in &packet_buf {
+                    pcm_bytes.extend_from_slice(&s.to_le_bytes());
+                }
+                let to_write = (audio_bytes_to_send as usize).min(pcm_bytes.len());
+                if writer.write_all(&pcm_bytes[..to_write]).is_err() {
+                    return Ok(());
+                }
+                audio_bytes_to_send -= to_write as u64;
+            }
+            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(_) => break,
+        }
+    }
+
+    let _ = writer.flush();
+    Ok(())
 }

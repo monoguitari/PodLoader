@@ -1,4 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import "./index.css";
+import { logger, LogEntry } from "./debugLogger";
 import type {
   DeviceConnectionState,
   DevicePlaylist,
@@ -245,6 +247,7 @@ export function App({ bridge }: AppProps) {
   const [editIsCompilation, setEditIsCompilation] = useState<boolean>(false);
   const [compilationModified, setCompilationModified] = useState<boolean>(false);
   const [targetPlaylistId, setTargetPlaylistId] = useState<number | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
   const [playbackStatus, setPlaybackStatus] = useState<PlaybackStatus>({
     state: "stopped",
     track: null,
@@ -259,12 +262,75 @@ export function App({ bridge }: AppProps) {
   const [exportSuccessMessage, setExportSuccessMessage] = useState<string | null>(
     null,
   );
+  const [loadingTrackId, setLoadingTrackId] = useState<number | null>(null);
+  const [loadingHostPath, setLoadingHostPath] = useState<string | null>(null);
+  const [isAudioBuffering, setIsAudioBuffering] = useState<boolean>(false);
+  const [isEjecting, setIsEjecting] = useState<boolean>(false);
+  const [isBrowsingHost, setIsBrowsingHost] = useState<boolean>(false);
+  const [isExporting, setIsExporting] = useState<boolean>(false);
+  const [isCommitting, setIsCommitting] = useState<boolean>(false);
+  const [isInitializing, setIsInitializing] = useState<boolean>(false);
+  const [searchQuery, setSearchQuery] = useState<string>("");
+  const [isHostBrowserCollapsed, setIsHostBrowserCollapsed] =
+    useState<boolean>(false);
+  const [isDebugOpen, setIsDebugOpen] = useState<boolean>(false);
+  const [logs, setLogs] = useState<LogEntry[]>(() => logger.getLogs());
+  const [logFilter, setLogFilter] = useState<string>("ALL");
+  const [logSearch, setLogSearch] = useState<string>("");
+  const [isAutoScroll, setIsAutoScroll] = useState<boolean>(true);
+  const [copiedLogs, setCopiedLogs] = useState<boolean>(false);
+  const logsContainerRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    return logger.subscribe(() => {
+      setLogs([...logger.getLogs()]);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (isAutoScroll && logsContainerRef.current) {
+      logsContainerRef.current.scrollTop = logsContainerRef.current.scrollHeight;
+    }
+  }, [logs, isAutoScroll]);
+
+  const filteredLogs = useMemo(() => {
+    return logs.filter((item) => {
+      if (logFilter === "ERROR" && item.level !== "error") return false;
+      if (
+        logFilter !== "ALL" &&
+        logFilter !== "ERROR" &&
+        item.category !== logFilter
+      )
+        return false;
+      if (logSearch.trim()) {
+        const q = logSearch.toLowerCase().trim();
+        const matchMsg = item.message.toLowerCase().includes(q);
+        const matchCat = item.category.toLowerCase().includes(q);
+        const matchDet = item.details
+          ? JSON.stringify(item.details).toLowerCase().includes(q)
+          : false;
+        return matchMsg || matchCat || matchDet;
+      }
+      return true;
+    });
+  }, [logs, logFilter, logSearch]);
 
   useEffect(() => {
     if (playbackStatus.state !== "playing") return;
     const interval = window.setInterval(() => {
       setPlaybackStatus((prev) => {
         if (prev.state !== "playing") return prev;
+        if (
+          audioRef.current &&
+          !isNaN(audioRef.current.currentTime) &&
+          audioRef.current.currentTime > 0
+        ) {
+          const curMs = Math.round(audioRef.current.currentTime * 1000);
+          return {
+            ...prev,
+            elapsedMs: curMs,
+          };
+        }
         const nextElapsed = prev.elapsedMs + 250;
         if (prev.durationMs > 0 && nextElapsed >= prev.durationMs) {
           return {
@@ -348,51 +414,168 @@ export function App({ bridge }: AppProps) {
       .filter((t): t is DeviceTrack => t !== undefined);
   }, [activeSession, selectedPlaylist]);
 
+  const filteredTracks: DeviceTrack[] = useMemo(() => {
+    if (!searchQuery.trim()) return orderedTracks;
+    const q = searchQuery.toLowerCase().trim();
+    return orderedTracks.filter(
+      (t) =>
+        t.title.toLowerCase().includes(q) ||
+        t.artist.toLowerCase().includes(q) ||
+        t.album.toLowerCase().includes(q) ||
+        t.genre.toLowerCase().includes(q) ||
+        String(t.year).includes(q),
+    );
+  }, [orderedTracks, searchQuery]);
+
+  const safePlayAudio = (audio: HTMLAudioElement | null) => {
+    if (!audio) return;
+    try {
+      const res = audio.play();
+      if (res && typeof res.catch === "function") {
+        res.catch((err) => {
+          if (err && err.name !== "AbortError") {
+            logger.audioWarn("Audio play() error:", err.message || err);
+          }
+        });
+      }
+    } catch (err) {
+      logger.audioWarn("Audio play() synchronous error:", err);
+    }
+  };
+
+  const safePauseAudio = (audio: HTMLAudioElement | null) => {
+    if (!audio) return;
+    try {
+      audio.pause();
+    } catch (err) {
+      logger.audioWarn("Audio pause error:", err);
+    }
+  };
+
+  const handleRowClick = (trackId: number, e: React.MouseEvent) => {
+    logger.ui(`Row click on track ID=${trackId}`);
+    if (e.ctrlKey || e.metaKey) {
+      setSelectedTrackIds((prev) =>
+        prev.includes(trackId)
+          ? prev.filter((id) => id !== trackId)
+          : [...prev, trackId],
+      );
+    } else if (e.shiftKey && selectedTrackIds.length > 0) {
+      const lastSelectedId = selectedTrackIds[selectedTrackIds.length - 1];
+      const lastIdx = filteredTracks.findIndex((t) => t.id === lastSelectedId);
+      const curIdx = filteredTracks.findIndex((t) => t.id === trackId);
+      if (lastIdx !== -1 && curIdx !== -1) {
+        const [start, end] = [
+          Math.min(lastIdx, curIdx),
+          Math.max(lastIdx, curIdx),
+        ];
+        const rangeIds = filteredTracks.slice(start, end + 1).map((t) => t.id);
+        const union = Array.from(new Set([...selectedTrackIds, ...rangeIds]));
+        setSelectedTrackIds(union);
+      }
+    } else {
+      setSelectedTrackIds([trackId]);
+    }
+  };
+
   const handlePlayHostFile = async (hostFile: HostFile) => {
+    logger.ui(`Play Host File: ${hostFile.path}`);
     if (!bridge.playHostFile) return;
+    setLoadingHostPath(hostFile.path);
+    setIsAudioBuffering(true);
     try {
       const status = await bridge.playHostFile(hostFile);
+      logger.ipc("playHostFile response", status);
       setPlaybackStatus(status);
       setErrorMessage(null);
+      if (audioRef.current) {
+        const srcUrl = `/api/audio_stream?path=${encodeURIComponent(hostFile.path)}&t=${Date.now()}`;
+        logger.audio(`Set audio.src to ${srcUrl}`);
+        audioRef.current.src = srcUrl;
+        audioRef.current.volume = status.volume;
+        safePlayAudio(audioRef.current);
+      }
     } catch (err) {
-      setErrorMessage(err instanceof Error ? err.message : String(err));
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.ipcError(`playHostFile error: ${msg}`);
+      setErrorMessage(msg);
+      setLoadingHostPath(null);
+      setIsAudioBuffering(false);
     }
   };
 
   const handlePlayDeviceTrack = async (trackId: number) => {
+    logger.ui(`Play Device Track: id=${trackId}`);
     if (!bridge.playDeviceTrack) return;
+    setLoadingTrackId(trackId);
+    setIsAudioBuffering(true);
     try {
       const status = await bridge.playDeviceTrack(trackId);
+      logger.ipc("playDeviceTrack response", status);
       setPlaybackStatus(status);
       setErrorMessage(null);
+      if (audioRef.current) {
+        const srcUrl = `/api/audio_stream?trackId=${trackId}&t=${Date.now()}`;
+        logger.audio(`Set audio.src to ${srcUrl}`);
+        audioRef.current.src = srcUrl;
+        audioRef.current.volume = status.volume;
+        safePlayAudio(audioRef.current);
+      }
     } catch (err) {
-      setErrorMessage(err instanceof Error ? err.message : String(err));
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.ipcError(`playDeviceTrack error: ${msg}`);
+      setErrorMessage(msg);
+      setLoadingTrackId(null);
+      setIsAudioBuffering(false);
     }
   };
 
   const handleTogglePlayPause = async () => {
+    logger.ui(`Toggle play/pause, current state: ${playbackStatus.state}`);
     if (playbackStatus.state === "playing" && bridge.pausePlayback) {
+      safePauseAudio(audioRef.current);
       const status = await bridge.pausePlayback();
       setPlaybackStatus(status);
+      setIsAudioBuffering(false);
     } else if (playbackStatus.state === "paused" && bridge.resumePlayback) {
+      setIsAudioBuffering(true);
+      safePlayAudio(audioRef.current);
       const status = await bridge.resumePlayback();
       setPlaybackStatus(status);
     }
   };
 
   const handleStopPlayback = async () => {
+    logger.ui("Stop playback");
+    setIsAudioBuffering(false);
+    setLoadingTrackId(null);
+    setLoadingHostPath(null);
+    if (audioRef.current) {
+      safePauseAudio(audioRef.current);
+      audioRef.current.currentTime = 0;
+      audioRef.current.removeAttribute("src");
+      audioRef.current.load();
+    }
     if (!bridge.stopPlayback) return;
     const status = await bridge.stopPlayback();
     setPlaybackStatus(status);
   };
 
   const handleSeekPlayback = async (positionMs: number) => {
+    logger.ui(`Seek playback to ${positionMs}ms`);
+    if (audioRef.current && isFinite(positionMs)) {
+      audioRef.current.currentTime = positionMs / 1000;
+    }
     if (!bridge.seekPlayback) return;
     const status = await bridge.seekPlayback(positionMs);
     setPlaybackStatus(status);
   };
 
   const handleVolumeChange = async (volume: number) => {
+    logger.ui(`Change volume to ${volume}`);
+    if (audioRef.current) {
+      audioRef.current.volume = volume;
+    }
     if (!bridge.setPlaybackVolume) return;
     const status = await bridge.setPlaybackVolume(volume);
     setPlaybackStatus(status);
@@ -417,8 +600,19 @@ export function App({ bridge }: AppProps) {
   };
 
   const executeEject = async (force: boolean) => {
-    if (!bridge.ejectDevice) return;
+    if (!bridge.ejectDevice || isEjecting) return;
+    setIsEjecting(true);
+    logger.ui(`Eject device: force=${force}`);
     try {
+      if (audioRef.current) {
+        safePauseAudio(audioRef.current);
+        audioRef.current.currentTime = 0;
+        audioRef.current.removeAttribute("src");
+        audioRef.current.load();
+      }
+      setIsAudioBuffering(false);
+      setLoadingTrackId(null);
+      setLoadingHostPath(null);
       await bridge.ejectDevice(force);
       if (bridge.getPlaybackStatus) {
         const status = await bridge.getPlaybackStatus();
@@ -442,6 +636,8 @@ export function App({ bridge }: AppProps) {
       setErrorMessage(null);
     } catch (err) {
       setErrorMessage(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsEjecting(false);
     }
   };
 
@@ -468,7 +664,9 @@ export function App({ bridge }: AppProps) {
   };
 
   const handleExportSelectedTracks = async () => {
-    if (!bridge.exportDeviceTracks || selectedTrackIds.length === 0) return;
+    if (!bridge.exportDeviceTracks || selectedTrackIds.length === 0 || isExporting) return;
+    setIsExporting(true);
+    logger.ui(`Export selected tracks count=${selectedTrackIds.length}`);
     try {
       const dest = exportDestination.trim() || "/music/PodLoader_Export";
       const res = await bridge.exportDeviceTracks(selectedTrackIds, dest);
@@ -476,11 +674,15 @@ export function App({ bridge }: AppProps) {
       setErrorMessage(null);
     } catch (err) {
       setErrorMessage(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsExporting(false);
     }
   };
 
   const handleExportPlaylist = async () => {
-    if (!bridge.exportDevicePlaylist || !selectedPlaylist) return;
+    if (!bridge.exportDevicePlaylist || !selectedPlaylist || isExporting) return;
+    setIsExporting(true);
+    logger.ui(`Export playlist: ${selectedPlaylist.name}`);
     try {
       const dest = exportDestination.trim() || "/music/PodLoader_Export";
       const res = await bridge.exportDevicePlaylist(selectedPlaylist.id, dest);
@@ -494,11 +696,12 @@ export function App({ bridge }: AppProps) {
   };
 
   const renderPlayerBar = () => (
-    <footer
-      role="region"
-      aria-label="Audio Player"
-      className="mini-audio-player-bar"
-    >
+    <>
+      <footer
+        role="region"
+        aria-label="Audio Player"
+        className="mini-audio-player-bar"
+      >
       <div className="player-track-info">
         {playbackStatus.track ? (
           <>
@@ -513,18 +716,26 @@ export function App({ bridge }: AppProps) {
             >
               {playbackStatus.track.sourceKind === "host" ? "Host" : "Device"}
             </span>
+            {(isAudioBuffering || loadingTrackId !== null || loadingHostPath !== null) && (
+              <span className="player-buffering-badge">
+                <span className="spinner-dot" /> Buffering...
+              </span>
+            )}
           </>
         ) : (
           <span className="player-idle">No track playing</span>
         )}
       </div>
-      <div className="player-controls">
+      <div className={`player-controls ${isAudioBuffering || loadingTrackId !== null || loadingHostPath !== null ? "is-buffering" : ""}`}>
         <button
           type="button"
           aria-label={playbackStatus.state === "playing" ? "Pause" : "Play"}
           disabled={!playbackStatus.track}
           onClick={handleTogglePlayPause}
         >
+          {(isAudioBuffering || loadingTrackId !== null || loadingHostPath !== null) && (
+            <span className="spinner-icon" aria-hidden="true" />
+          )}
           {playbackStatus.state === "playing" ? "Pause" : "Play"}
         </button>
         <button
@@ -563,15 +774,231 @@ export function App({ bridge }: AppProps) {
           value={playbackStatus.volume}
           onChange={(e) => handleVolumeChange(Number(e.target.value))}
         />
+        <audio
+          ref={audioRef}
+          style={{ display: "none" }}
+          preload="auto"
+          onLoadStart={() => {
+            logger.audio(`audio loadstart: ${audioRef.current?.src}`);
+            setIsAudioBuffering(true);
+          }}
+          onCanPlay={() => {
+            logger.audio(
+              `audio canplay: readyState=${audioRef.current?.readyState}, duration=${audioRef.current?.duration}s`,
+            );
+          }}
+          onPlaying={() => {
+            logger.audio("audio playing: hardware audio stream active");
+            setIsAudioBuffering(false);
+            setLoadingTrackId(null);
+            setLoadingHostPath(null);
+          }}
+          onPause={() => {
+            logger.audio("audio paused");
+            setIsAudioBuffering(false);
+          }}
+          onWaiting={() => {
+            logger.audioWarn("audio waiting / buffering...");
+            setIsAudioBuffering(true);
+          }}
+          onStalled={() => {
+            logger.audioWarn("audio stalled");
+            setIsAudioBuffering(true);
+          }}
+          onError={(e) => {
+            const err = e.currentTarget.error;
+            logger.audioError(
+              `audio error code=${err?.code}: ${err?.message || "playback failed"}`,
+            );
+            setIsAudioBuffering(false);
+            setLoadingTrackId(null);
+            setLoadingHostPath(null);
+          }}
+          onTimeUpdate={(e) => {
+            const audio = e.currentTarget;
+            if (audio && !isNaN(audio.currentTime) && audio.currentTime > 0) {
+              const curMs = Math.round(audio.currentTime * 1000);
+              setPlaybackStatus((prev) =>
+                prev.state === "playing" ? { ...prev, elapsedMs: curMs } : prev,
+              );
+            }
+          }}
+          onEnded={() => {
+            logger.audio("audio ended naturally");
+            setIsAudioBuffering(false);
+            setLoadingTrackId(null);
+            setLoadingHostPath(null);
+            setPlaybackStatus((prev) => ({
+              ...prev,
+              state: "stopped",
+              elapsedMs: prev.durationMs,
+            }));
+          }}
+        />
+      </div>
+      <div className="player-dock-status">
+        <button
+          type="button"
+          className={`status-pill debug-toggle-pill ${isDebugOpen ? "active" : ""}`}
+          onClick={() => setIsDebugOpen((prev) => !prev)}
+          title="Toggle Debug Activity Logger"
+        >
+          🪵 Debug Log {logs.length > 0 && `(${logs.length})`}
+        </button>
+        <span
+          className={`status-pill ${hasUncommittedChanges ? "pending" : "synced"}`}
+          title={
+            hasUncommittedChanges
+              ? "Sync Batch has uncommitted changes"
+              : "All changes committed"
+          }
+        >
+          {hasUncommittedChanges ? "● Staged Changes" : "● Synced"}
+        </span>
+        {activeSession && (
+          <span className="status-pill tracks-count">
+            {orderedTracks.length} tracks
+          </span>
+        )}
+        <span
+          className="status-pill ipc-status"
+          title="Native Rust Backend connected on port 41731"
+        >
+          ● IPC Active
+        </span>
       </div>
     </footer>
+    {isDebugOpen && (
+      <section
+        aria-label="Debug Activity Logger"
+        className="debug-log-drawer"
+      >
+        <div className="debug-log-header">
+          <div className="debug-log-title-cluster">
+            <span className="debug-log-badge">DEBUG ACTIVITY LOGGER</span>
+            <span className="debug-log-count">{filteredLogs.length} events</span>
+            <label className="debug-log-toggle-label">
+              <input
+                type="checkbox"
+                checked={logger.enabled}
+                onChange={(e) => logger.setEnabled(e.target.checked)}
+              />
+              Logging Active
+            </label>
+            <label className="debug-log-toggle-label">
+              <input
+                type="checkbox"
+                checked={isAutoScroll}
+                onChange={(e) => setIsAutoScroll(e.target.checked)}
+              />
+              Auto-Scroll
+            </label>
+          </div>
+          <div className="debug-log-controls">
+            <input
+              type="search"
+              placeholder="Filter logs by text..."
+              value={logSearch}
+              onChange={(e) => setLogSearch(e.target.value)}
+              className="debug-log-search"
+              aria-label="Filter logs"
+            />
+            <select
+              value={logFilter}
+              onChange={(e) => setLogFilter(e.target.value)}
+              className="debug-log-filter"
+              aria-label="Filter category"
+            >
+              <option value="ALL">All Categories</option>
+              <option value="AUDIO">Audio Only</option>
+              <option value="IPC">IPC / Bridge</option>
+              <option value="UI">UI Actions</option>
+              <option value="ERROR">Errors Only</option>
+            </select>
+            <button
+              type="button"
+              onClick={() => {
+                navigator.clipboard.writeText(logger.exportText());
+                setCopiedLogs(true);
+                setTimeout(() => setCopiedLogs(false), 2000);
+              }}
+              className="debug-log-btn"
+              title="Copy all logs to clipboard"
+            >
+              {copiedLogs ? "✓ Copied!" : "📋 Copy"}
+            </button>
+            <button
+              type="button"
+              onClick={() => logger.clear()}
+              className="debug-log-btn"
+              title="Clear log history"
+            >
+              🗑 Clear
+            </button>
+            <button
+              type="button"
+              onClick={() => setIsDebugOpen(false)}
+              className="debug-log-close"
+              aria-label="Close Debug Logger"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+        <div className="debug-log-body" ref={logsContainerRef}>
+          {filteredLogs.length === 0 ? (
+            <div className="debug-log-empty">No log events recorded.</div>
+          ) : (
+            filteredLogs.map((item) => (
+              <div
+                key={item.id}
+                className={`debug-log-row level-${item.level}`}
+              >
+                <span className="debug-log-time">{item.timestamp}</span>
+                <span
+                  className={`debug-log-cat cat-${item.category.toLowerCase()}`}
+                >
+                  {item.category}
+                </span>
+                <span className="debug-log-msg">{item.message}</span>
+                {item.details !== undefined && (
+                  <span className="debug-log-details">
+                    {typeof item.details === "object"
+                      ? JSON.stringify(item.details)
+                      : String(item.details)}
+                  </span>
+                )}
+              </div>
+            ))
+          )}
+        </div>
+      </section>
+    )}
+    </>
   );
 
   if (connection.status === "disconnected") {
     return (
-      <main>
-        <h1>PodLoader</h1>
-        <p>No iPod Device Connected. Connect a USB mass-storage Device to view its Device Library.</p>
+      <main className="podloader-shell disconnected-view">
+        <div className="empty-state-card">
+          <div className="macos-traffic-lights" aria-hidden="true">
+            <span className="traffic-dot close"></span>
+            <span className="traffic-dot minimize"></span>
+            <span className="traffic-dot zoom"></span>
+          </div>
+          <div className="ipod-illustration-badge"> iPod Device</div>
+          <h1>PodLoader</h1>
+          <p>
+            No iPod Device Connected. Connect a USB mass-storage Device to view
+            its Device Library.
+          </p>
+          <div className="empty-state-hint">
+            <span>
+              Supported: iPod Classic (1st–7th Gen), iPod Mini, iPod Nano, iPod
+              Video
+            </span>
+          </div>
+        </div>
         {renderPlayerBar()}
       </main>
     );
@@ -580,31 +1007,57 @@ export function App({ bridge }: AppProps) {
   if (connection.status === "uninitializedVolume") {
     const vol = connection.data;
     const handleInitialize = async () => {
-      const nextState = await bridge.initializeDevice(
-        vol.mountPath,
-        initDeviceName.trim() || vol.volumeName || "My iPod",
-      );
-      applyConnectionState(nextState);
+      if (isInitializing) return;
+      setIsInitializing(true);
+      try {
+        const nextState = await bridge.initializeDevice(
+          vol.mountPath,
+          initDeviceName.trim() || vol.volumeName || "My iPod",
+        );
+        applyConnectionState(nextState);
+      } finally {
+        setIsInitializing(false);
+      }
     };
 
     return (
-      <main>
-        <h1>PodLoader</h1>
-        <p>Uninitialized volume detected: {vol.volumeName}</p>
-        <p>
-          Mount Path: {vol.mountPath} ({formatGigabytes(vol.freeBytes)} free)
-        </p>
-        <div>
-          <label htmlFor="device-name-input">Device Name</label>
-          <input
-            id="device-name-input"
-            type="text"
-            value={initDeviceName}
-            onChange={(e) => setInitDeviceName(e.target.value)}
-          />
-          <button type="button" onClick={handleInitialize}>
-            Initialize Device
-          </button>
+      <main className="podloader-shell uninitialized-view">
+        <div className="init-wizard-card">
+          <div className="macos-traffic-lights" aria-hidden="true">
+            <span className="traffic-dot close"></span>
+            <span className="traffic-dot minimize"></span>
+            <span className="traffic-dot zoom"></span>
+          </div>
+          <div className="wizard-badge">New Device</div>
+          <h1>PodLoader</h1>
+          <p>Uninitialized volume detected: {vol.volumeName}</p>
+          <p>
+            Mount Path: {vol.mountPath} ({formatGigabytes(vol.freeBytes)} free)
+          </p>
+          <div className="init-form-group">
+            <label htmlFor="device-name-input">Device Name</label>
+            <input
+              id="device-name-input"
+              type="text"
+              value={initDeviceName}
+              onChange={(e) => setInitDeviceName(e.target.value)}
+            />
+            <button
+              type="button"
+              disabled={isInitializing}
+              className={isInitializing ? "btn-loading" : ""}
+              onClick={handleInitialize}
+            >
+              {isInitializing ? (
+                <>
+                  <span className="spinner-icon" aria-hidden="true" />
+                  Initializing...
+                </>
+              ) : (
+                "Initialize Device"
+              )}
+            </button>
+          </div>
         </div>
         {renderPlayerBar()}
       </main>
@@ -617,7 +1070,9 @@ export function App({ bridge }: AppProps) {
   const smartPlaylists = library.playlists.filter((p) => p.kind === "smart");
 
   const handleBrowseHost = async (targetPath: string) => {
-    if (!bridge.browseHostDirectory) return;
+    if (!bridge.browseHostDirectory || isBrowsingHost) return;
+    setIsBrowsingHost(true);
+    logger.ui(`Browse host directory: ${targetPath}`);
     try {
       const listing = await bridge.browseHostDirectory(targetPath);
       setHostListing(listing);
@@ -625,6 +1080,8 @@ export function App({ bridge }: AppProps) {
       setErrorMessage(null);
     } catch (err) {
       setErrorMessage(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsBrowsingHost(false);
     }
   };
 
@@ -693,7 +1150,9 @@ export function App({ bridge }: AppProps) {
   };
 
   const handleCommitBatch = async (maxTracksBeforeInterrupt?: number) => {
-    if (!bridge.commitSyncBatch) return;
+    if (!bridge.commitSyncBatch || isCommitting) return;
+    setIsCommitting(true);
+    logger.ui("Commit sync batch started");
     try {
       const outcome = await bridge.commitSyncBatch({
         ...(maxTracksBeforeInterrupt !== undefined
@@ -713,6 +1172,8 @@ export function App({ bridge }: AppProps) {
     } catch (err) {
       setTransferProgress(null);
       setErrorMessage(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsCommitting(false);
     }
   };
 
@@ -916,11 +1377,37 @@ export function App({ bridge }: AppProps) {
   return (
     <div className="podloader-shell">
       <header className="device-header">
-        <div>
+        <div className="header-left-cluster">
+          <div className="macos-traffic-lights" aria-hidden="true">
+            <span className="traffic-dot close"></span>
+            <span className="traffic-dot minimize"></span>
+            <span className="traffic-dot zoom"></span>
+          </div>
           <div className="device-title-row">
             <h1>{device.name}</h1>
-            <button type="button" onClick={handleEjectClick}>
-              Eject Device
+            <button
+              type="button"
+              aria-label="Eject Device"
+              disabled={isEjecting}
+              className={isEjecting ? "btn-loading" : ""}
+              onClick={handleEjectClick}
+            >
+              {isEjecting ? (
+                <>
+                  <span className="spinner-icon" aria-hidden="true" />
+                  Ejecting...
+                </>
+              ) : (
+                "Eject Device"
+              )}
+            </button>
+            <button
+              type="button"
+              className={`debug-header-toggle-btn ${isDebugOpen ? "active" : ""}`}
+              onClick={() => setIsDebugOpen((prev) => !prev)}
+              title="Toggle Debug Activity Logger"
+            >
+              🪵 Debug Log {logs.length > 0 && `(${logs.length})`}
             </button>
           </div>
           <p>
@@ -974,6 +1461,61 @@ export function App({ bridge }: AppProps) {
             )}
           </div>
         </div>
+
+        <div className="itunes-lcd-screen">
+          <div className="lcd-apple-logo"></div>
+          <div className="lcd-display-content">
+            {isAudioBuffering || loadingTrackId !== null || loadingHostPath !== null ? (
+              <>
+                <div className="lcd-track-title">
+                  {playbackStatus.track ? playbackStatus.track.title : "Loading Audio..."}
+                </div>
+                <div className="lcd-track-artist lcd-buffering-pulse">
+                  <span className="lcd-spinner-dot" /> Buffering stream from {playbackStatus.track?.sourceKind === "device" || loadingTrackId !== null ? "iPod" : "Host"}...
+                </div>
+                <div className="lcd-progress-track lcd-indeterminate">
+                  <div className="lcd-progress-shimmer" />
+                </div>
+              </>
+            ) : playbackStatus.track ? (
+              <>
+                <div className="lcd-track-title">
+                  {playbackStatus.track.title}
+                </div>
+                <div className="lcd-track-artist">
+                  {playbackStatus.track.artist} — {playbackStatus.track.album}
+                </div>
+                <div className="lcd-progress-track">
+                  <div
+                    className="lcd-progress-fill"
+                    style={{
+                      width: `${
+                        playbackStatus.durationMs > 0
+                          ? Math.min(
+                              100,
+                              Math.round(
+                                (playbackStatus.elapsedMs /
+                                  playbackStatus.durationMs) *
+                                  100,
+                              ),
+                            )
+                          : 0
+                      }%`,
+                    }}
+                  />
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="lcd-idle-title">iTunes iPod Manager</div>
+                <div className="lcd-idle-subtitle">
+                  {device.name} • {orderedTracks.length} Songs
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+
         <div className="storage-summary">
           <span>{formatGigabytes(device.usedBytes)} used</span>
           <span> / </span>
@@ -995,7 +1537,10 @@ export function App({ bridge }: AppProps) {
       )}
 
       <div className="workspace">
-        <aside aria-label="Host File Browser" className="host-browser-pane">
+        <aside
+          aria-label="Host File Browser"
+          className={`host-browser-pane ${isHostBrowserCollapsed ? "collapsed" : ""}`}
+        >
           <h2>Host Files</h2>
           <div className="host-path-bar">
             <label htmlFor="host-path-input">Host Folder</label>
@@ -1007,9 +1552,18 @@ export function App({ bridge }: AppProps) {
             />
             <button
               type="button"
+              disabled={isBrowsingHost}
+              className={isBrowsingHost ? "btn-loading" : ""}
               onClick={() => handleBrowseHost(hostPathInput)}
             >
-              Browse
+              {isBrowsingHost ? (
+                <>
+                  <span className="spinner-icon" aria-hidden="true" />
+                  Loading...
+                </>
+              ) : (
+                "Browse"
+              )}
             </button>
             {hostListing?.parentPath && (
               <button
@@ -1094,13 +1648,35 @@ export function App({ bridge }: AppProps) {
                   <td>{formatDuration(hf.durationMs)}</td>
                   <td>{hf.format}</td>
                   <td>
-                    <button
-                      type="button"
-                      aria-label={`Play ${hf.title}`}
-                      onClick={() => handlePlayHostFile(hf)}
-                    >
-                      ▶
-                    </button>
+                    {(() => {
+                      const isThisLoading =
+                        loadingHostPath === hf.path ||
+                        (playbackStatus.track?.sourcePath === hf.path &&
+                          isAudioBuffering);
+                      const isThisPlaying =
+                        playbackStatus.track?.sourcePath === hf.path &&
+                        playbackStatus.state === "playing" &&
+                        !isAudioBuffering;
+                      return (
+                        <button
+                          type="button"
+                          className={`track-play-btn ${isThisLoading ? "is-loading" : ""} ${isThisPlaying ? "is-playing" : ""}`}
+                          aria-label={`Play ${hf.title}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handlePlayHostFile(hf);
+                          }}
+                        >
+                          {isThisLoading ? (
+                            <span className="track-spinner" aria-hidden="true" />
+                          ) : isThisPlaying ? (
+                            "⏸"
+                          ) : (
+                            "▶"
+                          )}
+                        </button>
+                      );
+                    })()}
                     <button
                       type="button"
                       onClick={() => handleStagePaths([hf.path])}
@@ -1143,6 +1719,63 @@ export function App({ bridge }: AppProps) {
             selectedPlaylistId={selectedPlaylist?.id}
             onSelect={setSelectedPlaylistId}
           />
+          {device && (
+            <div className="sidebar-capacity-footer">
+              <div className="capacity-label-row">
+                <span className="capacity-title">Device Storage</span>
+                <span className="capacity-pct">
+                  {device.totalBytes > 0
+                    ? Math.min(
+                        100,
+                        Math.round(
+                          (device.usedBytes / device.totalBytes) * 100,
+                        ),
+                      )
+                    : 0}
+                  % capacity
+                </span>
+              </div>
+              <div
+                className="capacity-gauge-track"
+                role="progressbar"
+                aria-valuenow={
+                  device.totalBytes > 0
+                    ? Math.min(
+                        100,
+                        Math.round(
+                          (device.usedBytes / device.totalBytes) * 100,
+                        ),
+                      )
+                    : 0
+                }
+                aria-valuemin={0}
+                aria-valuemax={100}
+              >
+                <div
+                  className="capacity-gauge-fill"
+                  style={{
+                    width: `${
+                      device.totalBytes > 0
+                        ? Math.min(
+                            100,
+                            Math.round(
+                              (device.usedBytes / device.totalBytes) * 100,
+                            ),
+                          )
+                        : 0
+                    }%`,
+                  }}
+                />
+              </div>
+              <div className="storage-summary-mini">
+                <span>
+                  {formatGigabytes(device.usedBytes)} /{" "}
+                  {formatGigabytes(device.totalBytes)}
+                </span>
+                <span>{formatGigabytes(device.freeBytes)} avail</span>
+              </div>
+            </div>
+          )}
         </nav>
 
         {(() => {
@@ -1174,6 +1807,49 @@ export function App({ bridge }: AppProps) {
                 }
               }}
             >
+              <div className="track-pane-search-bar">
+                <div className="search-input-wrapper">
+                  <span className="search-icon">🔍</span>
+                  <input
+                    type="search"
+                    aria-label="Search Tracks"
+                    placeholder="Filter tracks by title, artist, album, genre..."
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                  />
+                  {searchQuery && (
+                    <button
+                      type="button"
+                      className="clear-search-btn"
+                      onClick={() => setSearchQuery("")}
+                      aria-label="Clear search"
+                    >
+                      ✕
+                    </button>
+                  )}
+                </div>
+                <div className="search-meta">
+                  <span className="track-counter-pill">
+                    {searchQuery
+                      ? `${filteredTracks.length} of ${orderedTracks.length} tracks`
+                      : `${orderedTracks.length} tracks`}
+                  </span>
+                  <button
+                    type="button"
+                    className="toggle-host-btn"
+                    onClick={() => setIsHostBrowserCollapsed((prev) => !prev)}
+                    title={
+                      isHostBrowserCollapsed
+                        ? "Show Host File Browser"
+                        : "Hide Host File Browser"
+                    }
+                  >
+                    {isHostBrowserCollapsed
+                      ? "📁 Show Host Files"
+                      : "✕ Hide Host Files"}
+                  </button>
+                </div>
+              </div>
           {hasStagedItems && (
             <section aria-label="Sync Batch" className="sync-batch-panel">
               <h2>
@@ -1301,8 +1977,20 @@ export function App({ bridge }: AppProps) {
               </ul>
 
               <div className="sync-batch-actions">
-                <button type="button" onClick={() => handleCommitBatch()}>
-                  Commit Sync Batch
+                <button
+                  type="button"
+                  disabled={isCommitting}
+                  className={isCommitting ? "btn-loading" : ""}
+                  onClick={() => handleCommitBatch()}
+                >
+                  {isCommitting ? (
+                    <>
+                      <span className="spinner-icon" aria-hidden="true" />
+                      Committing Sync Batch...
+                    </>
+                  ) : (
+                    "Commit Sync Batch"
+                  )}
                 </button>
                 {import.meta.env.DEV && (
                   <button
@@ -1398,13 +2086,33 @@ export function App({ bridge }: AppProps) {
             </div>
             <button
               type="button"
-              disabled={selectedTrackIds.length === 0}
+              disabled={selectedTrackIds.length === 0 || isExporting}
+              className={isExporting ? "btn-loading" : ""}
               onClick={handleExportSelectedTracks}
             >
-              Export Selected Tracks
+              {isExporting ? (
+                <>
+                  <span className="spinner-icon" aria-hidden="true" />
+                  Exporting...
+                </>
+              ) : (
+                "Export Selected Tracks"
+              )}
             </button>
-            <button type="button" onClick={handleExportPlaylist}>
-              Export Playlist
+            <button
+              type="button"
+              disabled={isExporting}
+              className={isExporting ? "btn-loading" : ""}
+              onClick={handleExportPlaylist}
+            >
+              {isExporting ? (
+                <>
+                  <span className="spinner-icon" aria-hidden="true" />
+                  Exporting...
+                </>
+              ) : (
+                "Export Playlist"
+              )}
             </button>
             {selectedPlaylist?.kind === "user" && (
               <button
@@ -1418,7 +2126,7 @@ export function App({ bridge }: AppProps) {
             {userPlaylists.length > 0 && (
               <div className="add-to-playlist-group">
                 <select
-                  aria-label="Target Playlist"
+                  aria-label="Destination Playlist"
                   value={targetPlaylistId ?? userPlaylists[0]?.id}
                   onChange={(e) => setTargetPlaylistId(Number(e.target.value))}
                 >
@@ -1451,12 +2159,12 @@ export function App({ bridge }: AppProps) {
                     type="checkbox"
                     aria-label="Select all tracks"
                     checked={
-                      orderedTracks.length > 0 &&
-                      selectedTrackIds.length === orderedTracks.length
+                      filteredTracks.length > 0 &&
+                      selectedTrackIds.length === filteredTracks.length
                     }
                     onChange={(e) => {
                       if (e.target.checked) {
-                        setSelectedTrackIds(orderedTracks.map((t) => t.id));
+                        setSelectedTrackIds(filteredTracks.map((t) => t.id));
                       } else {
                         setSelectedTrackIds([]);
                       }
@@ -1478,9 +2186,18 @@ export function App({ bridge }: AppProps) {
               </tr>
             </thead>
             <tbody>
-              {orderedTracks.map((track, idx) => (
+              {filteredTracks.map((track, idx) => (
                 <tr
                   key={track.id}
+                  className={
+                    selectedTrackIds.includes(track.id) ? "selected" : ""
+                  }
+                  onClick={(e) => {
+                    const target = e.target as HTMLElement;
+                    if (target.tagName !== "BUTTON" && target.tagName !== "INPUT") {
+                      handleRowClick(track.id, e);
+                    }
+                  }}
                   onDoubleClick={() => handlePlayDeviceTrack(track.id)}
                 >
                   <td>
@@ -1489,6 +2206,7 @@ export function App({ bridge }: AppProps) {
                       aria-label={`Select ${track.title}`}
                       checked={selectedTrackIds.includes(track.id)}
                       onChange={(e) => {
+                        e.stopPropagation();
                         if (e.target.checked) {
                           setSelectedTrackIds((prev) => [...prev, track.id]);
                         } else {
@@ -1500,13 +2218,35 @@ export function App({ bridge }: AppProps) {
                     />
                   </td>
                   <td>
-                    <button
-                      type="button"
-                      aria-label={`Play ${track.title}`}
-                      onClick={() => handlePlayDeviceTrack(track.id)}
-                    >
-                      ▶
-                    </button>
+                    {(() => {
+                      const isThisLoading =
+                        loadingTrackId === track.id ||
+                        (playbackStatus.track?.trackId === track.id &&
+                          isAudioBuffering);
+                      const isThisPlaying =
+                        playbackStatus.track?.trackId === track.id &&
+                        playbackStatus.state === "playing" &&
+                        !isAudioBuffering;
+                      return (
+                        <button
+                          type="button"
+                          className={`track-play-btn ${isThisLoading ? "is-loading" : ""} ${isThisPlaying ? "is-playing" : ""}`}
+                          aria-label={`Play ${track.title}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handlePlayDeviceTrack(track.id);
+                          }}
+                        >
+                          {isThisLoading ? (
+                            <span className="track-spinner" aria-hidden="true" />
+                          ) : isThisPlaying ? (
+                            "⏸"
+                          ) : (
+                            "▶"
+                          )}
+                        </button>
+                      );
+                    })()}
                     <span>{track.title}</span>
                   </td>
                   <td>{track.artist}</td>

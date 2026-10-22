@@ -1,6 +1,8 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+import "./index.css";
+import { logger } from "./debugLogger";
 import type {
   CommitOutcome,
   DeviceConnectionState,
@@ -28,16 +30,24 @@ declare global {
 }
 
 async function postJson<T>(url: string, body: unknown): Promise<T> {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const data = (await res.json()) as T & { error?: string };
-  if (data && typeof data === "object" && typeof data.error === "string") {
-    throw new Error(data.error);
+  logger.ipc(`POST ${url}`, body);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = (await res.json()) as T & { error?: string };
+    if (data && typeof data === "object" && typeof data.error === "string") {
+      logger.ipcError(`POST ${url} failed`, data.error);
+      throw new Error(data.error);
+    }
+    logger.ipc(`POST ${url} success`);
+    return data;
+  } catch (err) {
+    logger.ipcError(`POST ${url} error`, err instanceof Error ? err.message : String(err));
+    throw err;
   }
-  return data;
 }
 
 const defaultBridge: PodLoaderBridge = {

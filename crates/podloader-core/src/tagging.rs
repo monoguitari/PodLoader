@@ -42,14 +42,40 @@ pub fn update_mp3_id3v2_tags(
     edits: &TrackMetadataEdits,
     current: &DeviceTrack,
 ) -> Vec<u8> {
-    let audio_offset = if bytes.starts_with(b"ID3") && bytes.len() >= 10 {
+    let (audio_offset, existing_apic) = if bytes.starts_with(b"ID3") && bytes.len() >= 10 {
         let tag_size = (((bytes[6] as usize) & 0x7F) << 21)
             | (((bytes[7] as usize) & 0x7F) << 14)
             | (((bytes[8] as usize) & 0x7F) << 7)
             | ((bytes[9] as usize) & 0x7F);
-        (10 + tag_size).min(bytes.len())
+        let tag_end = (10 + tag_size).min(bytes.len());
+        let mut apic_data = None;
+        let mut cur = 10;
+        while cur + 10 <= tag_end {
+            let frame_id = &bytes[cur..cur + 4];
+            if frame_id[0] == 0 {
+                break;
+            }
+            // ID3v2.3 / ID3v2.4 frame size
+            let frame_size = u32::from_be_bytes([
+                bytes[cur + 4],
+                bytes[cur + 5],
+                bytes[cur + 6],
+                bytes[cur + 7],
+            ]) as usize;
+            let frame_total = 10 + frame_size;
+            if cur + frame_total <= tag_end {
+                if frame_id == b"APIC" {
+                    apic_data = Some(bytes[cur..cur + frame_total].to_vec());
+                    break;
+                }
+                cur += frame_total;
+            } else {
+                break;
+            }
+        }
+        (tag_end, apic_data)
     } else {
-        0
+        (0, None)
     };
 
     let title = edits.title.as_deref().unwrap_or(&current.title);
@@ -97,6 +123,9 @@ pub fn update_mp3_id3v2_tags(
     }
     if rating > 0 {
         frames.extend_from_slice(&encode_id3v2_popm_frame(rating));
+    }
+    if let Some(ref apic) = existing_apic {
+        frames.extend_from_slice(apic);
     }
 
     let size = frames.len() as u32;
